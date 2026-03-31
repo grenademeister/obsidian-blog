@@ -107,7 +107,8 @@ For each published note, the backend derives fields using these rules:
   - `my-note.md` becomes title `my-note`.
 - `date`
   - Uses frontmatter `date` when it is a valid ISO date.
-  - Invalid or missing dates are treated as undated and returned as `null`.
+  - Otherwise falls back to the file modification date.
+  - Returned as `YYYY-MM-DD`.
 - `tags`
   - Combines frontmatter `tags` with inline Markdown tags like `#ai`.
   - Tags are normalized to lowercase.
@@ -174,7 +175,7 @@ Behavior:
 - Reads the vault at request time.
 - Includes only published notes.
 - Sorts posts by date descending.
-- Undated posts are placed after dated posts.
+- Posts without a valid frontmatter date use file modification time for ordering.
 
 Example response:
 
@@ -190,7 +191,7 @@ Example response:
   {
     "title": "hello-world",
     "slug": "hello-world",
-    "date": null,
+    "date": "2026-03-31",
     "tags": ["notes"],
     "summary": "This is the first published post from the stub vault."
   }
@@ -277,7 +278,7 @@ Current behavior:
   - The file is skipped.
 - Invalid dates:
   - The post still loads.
-  - The `date` field becomes `null`.
+  - The backend falls back to the file modification date.
 
 This keeps one bad note from breaking the whole API response.
 
@@ -291,6 +292,7 @@ It contains:
 - private notes
 - nested notes
 - invalid date examples
+- file-time date fallback examples
 - notes showing filename-based titles
 
 Use it for local development and regression testing instead of pointing at the production vault.
@@ -303,6 +305,7 @@ The test suite currently covers:
 - filename-title and summary fallback rules
 - date sorting and undated behavior
 - invalid date handling
+- file metadata date fallback
 - malformed frontmatter skipping
 - non-mapping frontmatter skipping
 - nested vault traversal

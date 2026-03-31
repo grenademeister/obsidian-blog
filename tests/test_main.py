@@ -1,6 +1,9 @@
 import sys
 import textwrap
+from datetime import datetime
 from pathlib import Path
+
+import os
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -19,6 +22,11 @@ def make_app(tmp_path: Path) -> TestClient:
 def write_note(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(textwrap.dedent(content).strip() + "\n", encoding="utf-8")
+
+
+def set_mtime(path: Path, timestamp: datetime) -> None:
+    unix_time = timestamp.timestamp()
+    os.utime(path, (unix_time, unix_time))
 
 
 def test_health() -> None:
@@ -91,13 +99,14 @@ def test_posts_are_sorted_by_date_descending_with_undated_last(tmp_path: Path) -
         No date here.
         """,
     )
+    set_mtime(tmp_path / "undated.md", datetime(2026, 2, 1, 10, 0, 0))
 
     posts = load_posts(tmp_path)
 
     assert [post.slug for post in posts] == ["newer", "older", "undated"]
 
 
-def test_invalid_dates_are_treated_as_undated_and_sorted_last(tmp_path: Path) -> None:
+def test_invalid_dates_fall_back_to_file_time(tmp_path: Path) -> None:
     write_note(
         tmp_path / "dated.md",
         """
@@ -122,10 +131,29 @@ def test_invalid_dates_are_treated_as_undated_and_sorted_last(tmp_path: Path) ->
         Invalid date.
         """,
     )
+    set_mtime(tmp_path / "invalid-date.md", datetime(2026, 3, 15, 10, 0, 0))
 
     posts = load_posts(tmp_path)
 
-    assert [(post.slug, post.date) for post in posts] == [("dated", "2026-03-30"), ("invalid-date", None)]
+    assert [(post.slug, post.date) for post in posts] == [("dated", "2026-03-30"), ("invalid-date", "2026-03-15")]
+
+
+def test_missing_dates_fall_back_to_file_time(tmp_path: Path) -> None:
+    write_note(
+        tmp_path / "no-frontmatter-date.md",
+        """
+        #publish
+
+        Body without explicit date.
+        """,
+    )
+    set_mtime(tmp_path / "no-frontmatter-date.md", datetime(2026, 1, 5, 9, 0, 0))
+
+    client = make_app(tmp_path)
+    response = client.get("/posts/no-frontmatter-date")
+
+    assert response.status_code == 200
+    assert response.json()["date"] == "2026-01-05"
 
 
 def test_summary_and_tags_fallbacks_with_filename_title(tmp_path: Path) -> None:

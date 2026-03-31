@@ -113,6 +113,15 @@ def normalize_date(value: object) -> tuple[str | None, date | None]:
     return None, None
 
 
+def file_date(path: Path) -> tuple[str | None, date | None]:
+    try:
+        modified = datetime.fromtimestamp(path.stat().st_mtime)
+    except OSError:
+        return None, None
+    parsed = modified.date()
+    return parsed.isoformat(), parsed
+
+
 def extract_inline_tags(body: str) -> list[str]:
     seen: set[str] = set()
     tags: list[str] = []
@@ -231,6 +240,8 @@ def parse_post(path: Path, renderer: mistune.Markdown) -> LoadedPost | None:
 
     render_body = strip_tag_only_lines(body)
     date_value, sort_date = normalize_date(metadata.get("date"))
+    if date_value is None or sort_date is None:
+        date_value, sort_date = file_date(path)
     slug = path.stem
     title = extract_title(slug)
     summary = extract_summary(metadata, body)
