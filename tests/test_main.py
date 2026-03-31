@@ -12,7 +12,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from fastapi.testclient import TestClient
 
-from main import Settings, create_app, get_cached_posts, load_posts, reset_post_cache
+from main import Settings, create_app, get_cached_posts, load_posts, reset_asset_cache, reset_post_cache
 
 
 def make_app(tmp_path: Path) -> TestClient:
@@ -30,11 +30,18 @@ def set_mtime(path: Path, timestamp: datetime) -> None:
     os.utime(path, (unix_time, unix_time))
 
 
+def write_binary(path: Path, content: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(content)
+
+
 @pytest.fixture(autouse=True)
 def clear_post_cache() -> None:
     reset_post_cache()
+    reset_asset_cache()
     yield
     reset_post_cache()
+    reset_asset_cache()
 
 
 def test_health() -> None:
@@ -336,6 +343,120 @@ def test_tag_only_lines_are_not_rendered_into_html(tmp_path: Path) -> None:
     assert "Actual body paragraph." in html
     assert "#publish" not in html
     assert "#ai" not in html
+
+
+def test_obsidian_image_embed_renders_media_url(tmp_path: Path) -> None:
+    write_binary(tmp_path / "00_Meta" / "sample.jpg", b"fake-jpg")
+    write_note(
+        tmp_path / "image-note.md",
+        """
+        #publish
+
+        ![[sample.jpg]]
+        """,
+    )
+
+    client = make_app(tmp_path)
+    response = client.get("/posts/image-note")
+
+    assert response.status_code == 200
+    assert '<img src="/media/by-name/sample.jpg" alt="sample" />' in response.json()["html"]
+
+
+def test_obsidian_image_embed_with_width_renders_img_tag_width(tmp_path: Path) -> None:
+    write_binary(tmp_path / "00_Meta" / "wide.png", b"fake-png")
+    write_note(
+        tmp_path / "wide-image.md",
+        """
+        #publish
+
+        ![[wide.png|200]]
+        """,
+    )
+
+    client = make_app(tmp_path)
+    response = client.get("/posts/wide-image")
+
+    assert response.status_code == 200
+    assert 'src="/media/by-name/wide.png"' in response.json()["html"]
+    assert 'width="200"' in response.json()["html"]
+
+
+def test_relative_markdown_image_renders_media_by_path_url(tmp_path: Path) -> None:
+    write_binary(tmp_path / "00_Meta" / "growth.png", b"fake-growth")
+    write_note(
+        tmp_path / "nested" / "relative-image.md",
+        """
+        #publish
+
+        ![Progressive Overload](../00_Meta/growth.png)
+        """,
+    )
+
+    client = make_app(tmp_path)
+    response = client.get("/posts/relative-image")
+
+    assert response.status_code == 200
+    assert "/media/by-path/00_Meta/growth.png" in response.json()["html"]
+
+
+def test_remote_markdown_image_url_is_left_unchanged(tmp_path: Path) -> None:
+    write_note(
+        tmp_path / "remote-image.md",
+        """
+        #publish
+
+        ![Remote](https://example.com/image.png)
+        """,
+    )
+
+    client = make_app(tmp_path)
+    response = client.get("/posts/remote-image")
+
+    assert response.status_code == 200
+    assert 'src="https://example.com/image.png"' in response.json()["html"]
+
+
+def test_media_by_name_serves_image_bytes(tmp_path: Path) -> None:
+    image_bytes = b"fake-image-data"
+    write_binary(tmp_path / "00_Meta" / "asset.jpg", image_bytes)
+
+    client = make_app(tmp_path)
+    response = client.get("/media/by-name/asset.jpg")
+
+    assert response.status_code == 200
+    assert response.content == image_bytes
+    assert response.headers["content-type"].startswith("image/jpeg")
+
+
+def test_media_by_path_serves_image_bytes(tmp_path: Path) -> None:
+    image_bytes = b"fake-png-data"
+    write_binary(tmp_path / "images" / "chart.png", image_bytes)
+
+    client = make_app(tmp_path)
+    response = client.get("/media/by-path/images/chart.png")
+
+    assert response.status_code == 200
+    assert response.content == image_bytes
+    assert response.headers["content-type"].startswith("image/png")
+
+
+def test_media_endpoints_reject_traversal_and_non_image_files(tmp_path: Path) -> None:
+    write_note(
+        tmp_path / "plain.md",
+        """
+        #publish
+
+        Body.
+        """,
+    )
+
+    client = make_app(tmp_path)
+    traversal = client.get("/media/by-path/../plain.md")
+    non_image = client.get("/media/by-name/plain.md")
+
+    assert traversal.status_code == 404
+    assert non_image.status_code == 404
 
 
 def test_loader_reads_nested_markdown_files(tmp_path: Path) -> None:

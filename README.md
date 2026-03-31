@@ -11,6 +11,7 @@ The service reads Markdown files from a vault directory on disk, filters to publ
 - Publishes only notes containing `#publish`.
 - Returns post summaries through `/posts`.
 - Returns rendered post content through `/posts/{slug}`.
+- Serves local note images through `/media/...`.
 - Provides simple search through `/posts/search?q=...`.
 - Uses direct disk reads when the vault changes, with an in-process cache between changes.
 - No database or build step.
@@ -86,6 +87,13 @@ summary: Short preview text.
 Hello from the post body.
 ```
 
+Image references currently supported:
+
+- Obsidian embeds such as `![[sample.jpg]]`
+- Obsidian embeds with width such as `![[sample.jpg|200]]`
+- Standard Markdown local images such as `![Alt](../../00_Meta/growth.png)`
+- Standard Markdown remote images such as `![Alt](https://example.com/image.png)`
+
 #### Publish Rule
 
 A note is public only if the body contains `#publish`.
@@ -123,6 +131,7 @@ For each published note, the backend derives fields using these rules:
 - `html`
   - Generated from the Markdown body using `mistune`.
   - Tag-only lines such as `#publish #ai` are removed before rendering.
+  - Obsidian image embeds are rewritten to API-served image URLs before rendering.
 
 ### Directory Behavior
 
@@ -208,6 +217,7 @@ Behavior:
 - Matches by filename-based slug.
 - Returns `404` if the slug does not exist.
 - Returns `404` if the file exists but is not published.
+- Rewrites local image references in the HTML to `/media/...` URLs.
 
 Example response:
 
@@ -220,6 +230,38 @@ Example response:
   "summary": "Frontmatter summary for the list response.",
   "html": "<p>Hello from the frontmatter-backed post.</p>\n<h2>Heading</h2>\n<p>More body content.</p>\n"
 }
+```
+
+#### `GET /media/by-name/{asset_name}`
+
+Serves an image referenced by filename, mainly for Obsidian embeds like `![[image.jpg]]`.
+
+Behavior:
+
+- Only image extensions are allowed.
+- Looks up the file by basename anywhere in the vault.
+- Returns `404` if the image does not exist.
+
+Example:
+
+```text
+/media/by-name/Screenshot_20260311_020230_Termux.jpg
+```
+
+#### `GET /media/by-path/{asset_path}`
+
+Serves an image by vault-relative path, mainly for standard Markdown image paths.
+
+Behavior:
+
+- Only image extensions are allowed.
+- Path traversal is rejected.
+- Returns `404` if the image does not exist.
+
+Example:
+
+```text
+/media/by-path/00_Meta/growth.png
 ```
 
 #### `GET /posts/search?q=...`

@@ -1,25 +1,32 @@
 from __future__ import annotations
 
 import logging
+import mimetypes
 import os
 import re
 import textwrap
+from collections import defaultdict
 from dataclasses import dataclass
 from datetime import date, datetime
 from functools import lru_cache
 from pathlib import Path
+from urllib.parse import quote
 
 import mistune
 import uvicorn
 import yaml
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 
 logger = logging.getLogger(__name__)
 TAG_PATTERN = re.compile(r"(?<!\w)#([A-Za-z0-9_-]+)")
+OBSIDIAN_IMAGE_PATTERN = re.compile(r"!\[\[([^\]]+)\]\]")
+MARKDOWN_IMAGE_PATTERN = re.compile(r"!\[([^\]]*)\]\(([^)]+)\)")
 DEFAULT_CORS_ORIGINS = ["https://grenademeister.github.io"]
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".svg"}
 
 
 class PostSummary(BaseModel):
@@ -63,7 +70,14 @@ class PostCache:
     posts: list[LoadedPost] | None = None
 
 
+@dataclass
+class AssetCache:
+    fingerprint: tuple[FileFingerprint, ...] | None = None
+    by_name: dict[str, list[Path]] | None = None
+
+
 POST_CACHE = PostCache()
+ASSET_CACHE = AssetCache()
 
 
 def to_post_summary(post: LoadedPost) -> PostSummary:
@@ -85,6 +99,11 @@ def parse_cors_origins(raw: str | None) -> list[str]:
 def reset_post_cache() -> None:
     POST_CACHE.fingerprint = None
     POST_CACHE.posts = None
+
+
+def reset_asset_cache() -> None:
+    ASSET_CACHE.fingerprint = None
+    ASSET_CACHE.by_name = None
 
 
 @lru_cache(maxsize=1)
@@ -114,6 +133,10 @@ def strip_frontmatter(text: str) -> tuple[dict, str]:
         raise ValueError("frontmatter must be a mapping")
 
     return metadata, remainder
+
+
+def is_image_path(path: Path) -> bool:
+    return path.suffix.lower() in IMAGE_EXTENSIONS
 
 
 def normalize_date(value: object) -> tuple[str | None, date | None]:
@@ -243,10 +266,74 @@ def combine_tags(metadata: dict, body: str) -> tuple[list[str], bool]:
 
 
 def build_markdown_renderer() -> mistune.Markdown:
-    return mistune.create_markdown(hard_wrap=True)
+    return mistune.create_markdown(hard_wrap=True, escape=False)
 
 
-def parse_post(path: Path, renderer: mistune.Markdown) -> LoadedPost | None:
+def media_url_for_name(asset_name: str) -> str:
+    return f"/media/by-name/{quote(asset_name, safe='')}"
+
+
+def media_url_for_path(asset_path: Path) -> str:
+    return f"/media/by-path/{quote(asset_path.as_posix(), safe='/')}"
+
+
+def resolve_relative_asset_path(note_path: Path, raw_src: str, vault_dir: Path) -> Path | None:
+    cleaned = raw_src.strip().strip("<>")
+    if not cleaned:
+        return None
+    if re.match(r"^[a-z]+:", cleaned, re.IGNORECASE) or cleaned.startswith(("/", "#", "blob:")):
+        return None
+
+    resolved = (note_path.parent / cleaned).resolve()
+    vault_root = vault_dir.resolve()
+    try:
+        relative = resolved.relative_to(vault_root)
+    except ValueError:
+        return None
+    if not is_image_path(relative):
+        return None
+    return relative
+
+
+def replace_obsidian_images(body: str) -> str:
+    def replacement(match: re.Match[str]) -> str:
+        inner = match.group(1).strip()
+        parts = [part.strip() for part in inner.split("|")]
+        asset_ref = parts[0]
+        if not asset_ref:
+            return match.group(0)
+
+        width = next((part for part in parts[1:] if part.isdigit()), None)
+        alt = Path(asset_ref).stem
+        url = media_url_for_name(asset_ref)
+        if width:
+            return f'<img src="{url}" alt="{alt}" width="{width}" />'
+        return f'<img src="{url}" alt="{alt}" />'
+
+    return OBSIDIAN_IMAGE_PATTERN.sub(replacement, body)
+
+
+def replace_markdown_local_images(body: str, note_path: Path, vault_dir: Path) -> str:
+    def replacement(match: re.Match[str]) -> str:
+        alt_text, raw_src = match.groups()
+        cleaned_src = raw_src.strip().strip("<>")
+        if re.match(r"^[a-z]+:", cleaned_src, re.IGNORECASE) or cleaned_src.startswith(("/", "#", "blob:")):
+            return match.group(0)
+
+        relative = resolve_relative_asset_path(note_path, cleaned_src, vault_dir)
+        if relative is None:
+            return match.group(0)
+        return f"![{alt_text}]({media_url_for_path(relative)})"
+
+    return MARKDOWN_IMAGE_PATTERN.sub(replacement, body)
+
+
+def rewrite_image_links(body: str, note_path: Path, vault_dir: Path) -> str:
+    body = replace_obsidian_images(body)
+    return replace_markdown_local_images(body, note_path, vault_dir)
+
+
+def parse_post(path: Path, renderer: mistune.Markdown, vault_dir: Path) -> LoadedPost | None:
     try:
         metadata, body = strip_frontmatter(path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
@@ -258,7 +345,7 @@ def parse_post(path: Path, renderer: mistune.Markdown) -> LoadedPost | None:
     if not is_published:
         return None
 
-    render_body = strip_tag_only_lines(body)
+    render_body = rewrite_image_links(strip_tag_only_lines(body), path, vault_dir)
     date_value, sort_date = normalize_date(metadata.get("date"))
     if date_value is None or sort_date is None:
         date_value, sort_date = file_date(path)
@@ -286,7 +373,7 @@ def load_posts(vault_dir: Path) -> list[LoadedPost]:
         return posts
 
     for path in sorted(vault_dir.rglob("*.md")):
-        post = parse_post(path, renderer)
+        post = parse_post(path, renderer, vault_dir)
         if post is not None:
             posts.append(post)
 
@@ -299,7 +386,11 @@ def build_vault_fingerprint(vault_dir: Path) -> tuple[FileFingerprint, ...]:
         return ()
 
     fingerprints: list[FileFingerprint] = []
-    for path in sorted(vault_dir.rglob("*.md")):
+    for path in sorted(vault_dir.rglob("*")):
+        if not path.is_file():
+            continue
+        if path.suffix.lower() not in IMAGE_EXTENSIONS and path.suffix.lower() != ".md":
+            continue
         try:
             modified_time = path.stat().st_mtime
         except OSError:
@@ -318,6 +409,66 @@ def get_cached_posts(vault_dir: Path) -> list[LoadedPost]:
     POST_CACHE.fingerprint = fingerprint
     POST_CACHE.posts = posts
     return posts
+
+
+def build_asset_fingerprint(vault_dir: Path) -> tuple[FileFingerprint, ...]:
+    if not vault_dir.exists():
+        return ()
+
+    fingerprints: list[FileFingerprint] = []
+    for path in sorted(vault_dir.rglob("*")):
+        if not path.is_file() or not is_image_path(path):
+            continue
+        try:
+            modified_time = path.stat().st_mtime
+        except OSError:
+            continue
+        fingerprints.append(FileFingerprint(path=str(path.resolve()), modified_time=modified_time))
+    return tuple(fingerprints)
+
+
+def build_asset_index(vault_dir: Path) -> dict[str, list[Path]]:
+    index: dict[str, list[Path]] = defaultdict(list)
+    if not vault_dir.exists():
+        return {}
+
+    for path in sorted(vault_dir.rglob("*")):
+        if not path.is_file() or not is_image_path(path):
+            continue
+        relative = path.resolve().relative_to(vault_dir.resolve())
+        index[path.name].append(relative)
+    return dict(index)
+
+
+def get_cached_asset_index(vault_dir: Path) -> dict[str, list[Path]]:
+    fingerprint = build_asset_fingerprint(vault_dir)
+    if ASSET_CACHE.fingerprint == fingerprint and ASSET_CACHE.by_name is not None:
+        return ASSET_CACHE.by_name
+
+    by_name = build_asset_index(vault_dir)
+    ASSET_CACHE.fingerprint = fingerprint
+    ASSET_CACHE.by_name = by_name
+    return by_name
+
+
+def resolve_media_path(vault_dir: Path, asset_path: Path) -> Path:
+    if asset_path.is_absolute() or ".." in asset_path.parts or not is_image_path(asset_path):
+        raise HTTPException(status_code=404, detail="Media not found")
+
+    vault_root = vault_dir.resolve()
+    resolved = (vault_root / asset_path).resolve()
+    try:
+        resolved.relative_to(vault_root)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail="Media not found") from exc
+    if not resolved.is_file():
+        raise HTTPException(status_code=404, detail="Media not found")
+    return resolved
+
+
+def build_file_response(path: Path) -> FileResponse:
+    media_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+    return FileResponse(path=path, media_type=media_type, filename=path.name)
 
 
 def build_search_text(post: LoadedPost) -> str:
@@ -375,6 +526,25 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return [to_post_summary(post) for post in matches]
+
+    @app.get("/media/by-name/{asset_name}")
+    def get_media_by_name(asset_name: str) -> FileResponse:
+        if "/" in asset_name or "\\" in asset_name:
+            raise HTTPException(status_code=404, detail="Media not found")
+        if not is_image_path(Path(asset_name)):
+            raise HTTPException(status_code=404, detail="Media not found")
+
+        asset_index = get_cached_asset_index(settings.vault_dir)
+        matches = asset_index.get(asset_name)
+        if not matches:
+            raise HTTPException(status_code=404, detail="Media not found")
+        path = resolve_media_path(settings.vault_dir, matches[0])
+        return build_file_response(path)
+
+    @app.get("/media/by-path/{asset_path:path}")
+    def get_media_by_path(asset_path: str) -> FileResponse:
+        path = resolve_media_path(settings.vault_dir, Path(asset_path))
+        return build_file_response(path)
 
     @app.get("/posts/{slug}", response_model=PostDetail)
     def get_post(slug: str) -> PostDetail:
