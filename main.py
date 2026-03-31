@@ -90,7 +90,7 @@ def reset_post_cache() -> None:
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
     return Settings(
-        vault_dir=Path(os.getenv("VAULT_DIR", "./stub_vault")).resolve(),
+        vault_dir=Path(os.getenv("VAULT_DIR", "./vault_copy")).resolve(),
         cors_origins=parse_cors_origins(os.getenv("CORS_ORIGINS")),
     )
 
@@ -330,6 +330,12 @@ def search_posts(posts: list[LoadedPost], query: str) -> list[LoadedPost]:
     if not normalized_query:
         raise ValueError("Query must not be blank")
 
+    if normalized_query.startswith("#"):
+        tag_query = normalized_query[1:].strip()
+        if not tag_query:
+            raise ValueError("Tag query must include a tag name")
+        return [post for post in posts if tag_query in post.tags]
+
     return [post for post in posts if normalized_query in build_search_text(post)]
 
 
@@ -364,7 +370,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(status_code=400, detail="Query parameter 'q' is required")
 
         posts = get_cached_posts(settings.vault_dir)
-        return [to_post_summary(post) for post in search_posts(posts, q)]
+        try:
+            matches = search_posts(posts, q)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return [to_post_summary(post) for post in matches]
 
     @app.get("/posts/{slug}", response_model=PostDetail)
     def get_post(slug: str) -> PostDetail:

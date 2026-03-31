@@ -446,6 +446,63 @@ def test_search_matches_title_summary_and_tags(tmp_path: Path) -> None:
     assert [post["slug"] for post in tag_response.json()] == ["tag-match"]
 
 
+def test_hash_prefixed_search_matches_exact_tag_name(tmp_path: Path) -> None:
+    write_note(
+        tmp_path / "todo-note.md",
+        """
+        ---
+        tags:
+          - todo
+        ---
+
+        #publish
+
+        Task note.
+        """,
+    )
+    write_note(
+        tmp_path / "todo-list.md",
+        """
+        ---
+        tags:
+          - todo-list
+        ---
+
+        #publish
+
+        Similar but different tag.
+        """,
+    )
+
+    client = make_app(tmp_path)
+    response = client.get("/posts/search", params={"q": "#todo"})
+
+    assert response.status_code == 200
+    assert [post["slug"] for post in response.json()] == ["todo-note"]
+
+
+def test_hash_prefixed_search_is_case_insensitive(tmp_path: Path) -> None:
+    write_note(
+        tmp_path / "mixed-tag.md",
+        """
+        ---
+        tags:
+          - ToDo
+        ---
+
+        #publish
+
+        Mixed case tag.
+        """,
+    )
+
+    client = make_app(tmp_path)
+    response = client.get("/posts/search", params={"q": "#TODO"})
+
+    assert response.status_code == 200
+    assert [post["slug"] for post in response.json()] == ["mixed-tag"]
+
+
 def test_search_trims_query_whitespace(tmp_path: Path) -> None:
     write_note(
         tmp_path / "trimmed.md",
@@ -527,9 +584,11 @@ def test_search_rejects_missing_or_blank_queries(tmp_path: Path) -> None:
 
     missing = client.get("/posts/search")
     blank = client.get("/posts/search", params={"q": "   "})
+    tag_only = client.get("/posts/search", params={"q": "#"})
 
     assert missing.status_code == 400
     assert blank.status_code == 400
+    assert tag_only.status_code == 400
 
 
 def test_search_route_is_not_captured_by_slug_route(tmp_path: Path) -> None:

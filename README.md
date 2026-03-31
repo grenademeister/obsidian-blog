@@ -11,7 +11,7 @@ The service reads Markdown files from a vault directory on disk, filters to publ
 - Publishes only notes containing `#publish`.
 - Returns post summaries through `/posts`.
 - Returns rendered post content through `/posts/{slug}`.
-- Provides simple substring search through `/posts/search?q=...`.
+- Provides simple search through `/posts/search?q=...`.
 - Uses direct disk reads when the vault changes, with an in-process cache between changes.
 - No database or build step.
 
@@ -48,7 +48,7 @@ uv run pytest -q
 The backend is configured with environment variables.
 
 ```bash
-export VAULT_DIR=./stub_vault
+export VAULT_DIR=./vault_copy
 export CORS_ORIGINS=https://grenademeister.github.io
 ```
 
@@ -56,8 +56,8 @@ Available settings:
 
 - `VAULT_DIR`
   - Path to the Markdown vault to read from.
-  - Default: `./stub_vault`
-  - The default exists to protect the real production vault during development.
+  - Default: `./vault_copy`
+  - The default is a local copy of the real vault so development does not read directly from the synced source.
 - `CORS_ORIGINS`
   - Comma-separated list of allowed origins.
   - Default: `https://grenademeister.github.io`
@@ -229,16 +229,22 @@ Simple search endpoint over published post summaries.
 Behavior:
 
 - Searches only published posts.
-- Uses case-insensitive substring matching.
-- Searches `title`, `summary`, and `tags`.
+- Normal text queries use case-insensitive substring matching across `title`, `summary`, and `tags`.
+- `#tag` queries perform exact case-insensitive tag matching.
 - Preserves the same date ordering as `/posts`.
-- Returns `400` if `q` is missing or blank.
+- Returns `400` if `q` is missing, blank, or just `#`.
 - Returns `[]` if no posts match.
 
 Example request:
 
 ```bash
 curl "http://127.0.0.1:8000/posts/search?q=notes"
+```
+
+Tag search example:
+
+```bash
+curl "http://127.0.0.1:8000/posts/search?q=%23todo"
 ```
 
 Example response:
@@ -304,7 +310,7 @@ What this means operationally:
 
 ### Stub Vault
 
-The repository ships with a development stub vault in [stub_vault](/home/grenade/workspace/tries/2026-03-31-backend/stub_vault).
+The repository ships with a small stub vault in [stub_vault](/home/grenade/workspace/tries/2026-03-31-backend/stub_vault) for tests, and the runtime default now points at a git-ignored local copy in `./vault_copy`.
 
 It contains:
 
@@ -315,7 +321,7 @@ It contains:
 - file-time date fallback examples
 - notes showing filename-based titles
 
-Use it for local development and regression testing instead of pointing at the production vault.
+Use `stub_vault` for regression tests. Use `vault_copy` for local runs against a safe copy of the real vault.
 
 ### Test Coverage
 
