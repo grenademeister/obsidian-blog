@@ -300,6 +300,24 @@ def test_post_detail_renders_html(tmp_path: Path) -> None:
     assert "<strong>world</strong>" in response.json()["html"]
 
 
+def test_post_detail_preserves_single_line_breaks_as_br(tmp_path: Path) -> None:
+    write_note(
+        tmp_path / "line-breaks.md",
+        """
+        #publish
+
+        first line
+        second line
+        """,
+    )
+
+    client = make_app(tmp_path)
+    response = client.get("/posts/line-breaks")
+
+    assert response.status_code == 200
+    assert "first line<br />" in response.json()["html"]
+
+
 def test_tag_only_lines_are_not_rendered_into_html(tmp_path: Path) -> None:
     write_note(
         tmp_path / "tag-lines.md",

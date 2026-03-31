@@ -243,7 +243,7 @@ def combine_tags(metadata: dict, body: str) -> tuple[list[str], bool]:
 
 
 def build_markdown_renderer() -> mistune.Markdown:
-    return mistune.create_markdown()
+    return mistune.create_markdown(hard_wrap=True)
 
 
 def parse_post(path: Path, renderer: mistune.Markdown) -> LoadedPost | None:
