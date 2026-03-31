@@ -291,7 +291,6 @@ It contains:
 - public notes
 - private notes
 - nested notes
-- malformed frontmatter examples
 - invalid date examples
 - notes without explicit titles
 
