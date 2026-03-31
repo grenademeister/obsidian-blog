@@ -103,9 +103,8 @@ For each published note, the backend derives fields using these rules:
   - Uses the filename stem.
   - `my-note.md` becomes `my-note`.
 - `title`
-  - Frontmatter `title` if present and non-empty.
-  - Otherwise first Markdown H1 line like `# Title`.
-  - Otherwise the slug.
+  - Always uses the filename stem.
+  - `my-note.md` becomes title `my-note`.
 - `date`
   - Uses frontmatter `date` when it is a valid ISO date.
   - Invalid or missing dates are treated as undated and returned as `null`.
@@ -182,14 +181,14 @@ Example response:
 ```json
 [
   {
-    "title": "Frontmatter Title",
+    "title": "with-frontmatter",
     "slug": "with-frontmatter",
     "date": "2026-03-30",
     "tags": ["ai", "notes"],
     "summary": "Frontmatter summary for the list response."
   },
   {
-    "title": "Hello World",
+    "title": "hello-world",
     "slug": "hello-world",
     "date": null,
     "tags": ["notes"],
@@ -212,7 +211,7 @@ Example response:
 
 ```json
 {
-  "title": "Frontmatter Title",
+  "title": "with-frontmatter",
   "slug": "with-frontmatter",
   "date": "2026-03-30",
   "tags": ["ai", "notes"],
@@ -292,7 +291,7 @@ It contains:
 - private notes
 - nested notes
 - invalid date examples
-- notes without explicit titles
+- notes showing filename-based titles
 
 Use it for local development and regression testing instead of pointing at the production vault.
 
@@ -301,7 +300,7 @@ Use it for local development and regression testing instead of pointing at the p
 The test suite currently covers:
 
 - published vs unpublished filtering
-- summary and title fallback rules
+- filename-title and summary fallback rules
 - date sorting and undated behavior
 - invalid date handling
 - malformed frontmatter skipping

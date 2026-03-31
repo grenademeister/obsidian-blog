@@ -128,7 +128,7 @@ def test_invalid_dates_are_treated_as_undated_and_sorted_last(tmp_path: Path) ->
     assert [(post.slug, post.date) for post in posts] == [("dated", "2026-03-30"), ("invalid-date", None)]
 
 
-def test_title_summary_and_tags_fallbacks(tmp_path: Path) -> None:
+def test_summary_and_tags_fallbacks_with_filename_title(tmp_path: Path) -> None:
     write_note(
         tmp_path / "fallbacks.md",
         """
@@ -147,7 +147,7 @@ def test_title_summary_and_tags_fallbacks(tmp_path: Path) -> None:
 
     assert response.status_code == 200
     payload = response.json()
-    assert payload["title"] == "Derived Title"
+    assert payload["title"] == "fallbacks"
     assert payload["summary"] == "First paragraph becomes the summary."
     assert payload["tags"] == ["ml", "notes"]
 
@@ -189,7 +189,7 @@ def test_summary_is_truncated_for_long_first_paragraph(tmp_path: Path) -> None:
     assert summary.endswith("...")
 
 
-def test_frontmatter_overrides_title_and_summary(tmp_path: Path) -> None:
+def test_frontmatter_summary_does_not_override_filename_title(tmp_path: Path) -> None:
     write_note(
         tmp_path / "frontmatter.md",
         """
@@ -214,7 +214,7 @@ def test_frontmatter_overrides_title_and_summary(tmp_path: Path) -> None:
 
     assert response.status_code == 200
     payload = response.json()
-    assert payload["title"] == "Explicit Title"
+    assert payload["title"] == "frontmatter"
     assert payload["summary"] == "Explicit summary"
     assert payload["tags"] == ["ai"]
     assert payload["date"] == "2026-03-30"
@@ -358,7 +358,7 @@ def test_post_detail_404_for_missing_or_unpublished(tmp_path: Path) -> None:
 
 def test_search_matches_title_summary_and_tags(tmp_path: Path) -> None:
     write_note(
-        tmp_path / "title-match.md",
+        tmp_path / "searchable-title.md",
         """
         ---
         date: 2026-03-31
@@ -405,7 +405,7 @@ def test_search_matches_title_summary_and_tags(tmp_path: Path) -> None:
     summary_response = client.get("/posts/search", params={"q": "BETA"})
     tag_response = client.get("/posts/search", params={"q": "gamma"})
 
-    assert [post["slug"] for post in title_response.json()] == ["title-match"]
+    assert [post["slug"] for post in title_response.json()] == ["searchable-title"]
     assert [post["slug"] for post in summary_response.json()] == ["summary-match"]
     assert [post["slug"] for post in tag_response.json()] == ["tag-match"]
 

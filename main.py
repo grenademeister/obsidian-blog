@@ -145,16 +145,7 @@ def normalize_frontmatter_tags(value: object) -> list[str]:
     return tags
 
 
-def extract_title(metadata: dict, body: str, fallback: str) -> str:
-    title = metadata.get("title")
-    if isinstance(title, str) and title.strip():
-        return title.strip()
-
-    for line in body.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("# "):
-            return stripped[2:].strip()
-
+def extract_title(fallback: str) -> str:
     return fallback
 
 
@@ -241,7 +232,7 @@ def parse_post(path: Path, renderer: mistune.Markdown) -> LoadedPost | None:
     render_body = strip_tag_only_lines(body)
     date_value, sort_date = normalize_date(metadata.get("date"))
     slug = path.stem
-    title = extract_title(metadata, body, slug)
+    title = extract_title(slug)
     summary = extract_summary(metadata, body)
     html = renderer(render_body)
 
