@@ -51,6 +51,16 @@ class LoadedPost:
     html: str
 
 
+def to_post_summary(post: LoadedPost) -> PostSummary:
+    return PostSummary(
+        title=post.title,
+        slug=post.slug,
+        date=post.date,
+        tags=post.tags,
+        summary=post.summary,
+    )
+
+
 def parse_cors_origins(raw: str | None) -> list[str]:
     if not raw:
         return DEFAULT_CORS_ORIGINS
@@ -262,6 +272,19 @@ def load_posts(vault_dir: Path) -> list[LoadedPost]:
     return posts
 
 
+def build_search_text(post: LoadedPost) -> str:
+    parts = [post.title, post.summary, *post.tags]
+    return " ".join(part.lower() for part in parts if part)
+
+
+def search_posts(posts: list[LoadedPost], query: str) -> list[LoadedPost]:
+    normalized_query = query.strip().lower()
+    if not normalized_query:
+        raise ValueError("Query must not be blank")
+
+    return [post for post in posts if normalized_query in build_search_text(post)]
+
+
 def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or get_settings()
 
@@ -285,16 +308,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/posts", response_model=list[PostSummary])
     def list_posts() -> list[PostSummary]:
         posts = load_posts(settings.vault_dir)
-        return [
-            PostSummary(
-                title=post.title,
-                slug=post.slug,
-                date=post.date,
-                tags=post.tags,
-                summary=post.summary,
-            )
-            for post in posts
-        ]
+        return [to_post_summary(post) for post in posts]
+
+    @app.get("/posts/search", response_model=list[PostSummary])
+    def search_posts_endpoint(q: str | None = None) -> list[PostSummary]:
+        if q is None or not q.strip():
+            raise HTTPException(status_code=400, detail="Query parameter 'q' is required")
+
+        posts = load_posts(settings.vault_dir)
+        return [to_post_summary(post) for post in search_posts(posts, q)]
 
     @app.get("/posts/{slug}", response_model=PostDetail)
     def get_post(slug: str) -> PostDetail:

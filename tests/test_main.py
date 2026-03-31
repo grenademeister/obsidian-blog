@@ -168,3 +168,149 @@ def test_post_detail_404_for_missing_or_unpublished(tmp_path: Path) -> None:
 
     assert missing.status_code == 404
     assert private.status_code == 404
+
+
+def test_search_matches_title_summary_and_tags(tmp_path: Path) -> None:
+    write_note(
+        tmp_path / "title-match.md",
+        """
+        ---
+        date: 2026-03-31
+        ---
+
+        #publish
+
+        # Searchable Title
+
+        Alpha body.
+        """,
+    )
+    write_note(
+        tmp_path / "summary-match.md",
+        """
+        ---
+        date: 2026-03-30
+        summary: Compact beta summary
+        ---
+
+        #publish
+
+        Body text.
+        """,
+    )
+    write_note(
+        tmp_path / "tag-match.md",
+        """
+        ---
+        date: 2026-03-29
+        tags:
+          - gamma
+        ---
+
+        #publish
+
+        Body text.
+        """,
+    )
+
+    client = make_app(tmp_path)
+
+    title_response = client.get("/posts/search", params={"q": "searchable"})
+    summary_response = client.get("/posts/search", params={"q": "BETA"})
+    tag_response = client.get("/posts/search", params={"q": "gamma"})
+
+    assert [post["slug"] for post in title_response.json()] == ["title-match"]
+    assert [post["slug"] for post in summary_response.json()] == ["summary-match"]
+    assert [post["slug"] for post in tag_response.json()] == ["tag-match"]
+
+
+def test_search_uses_summary_fallback_and_preserves_date_order(tmp_path: Path) -> None:
+    write_note(
+        tmp_path / "newer.md",
+        """
+        ---
+        date: 2026-03-31
+        ---
+
+        #publish
+
+        Newest note mentions orbit in the first paragraph.
+        """,
+    )
+    write_note(
+        tmp_path / "older.md",
+        """
+        ---
+        date: 2026-03-01
+        ---
+
+        #publish
+
+        Older note also mentions orbit here.
+        """,
+    )
+
+    client = make_app(tmp_path)
+    response = client.get("/posts/search", params={"q": "orbit"})
+
+    assert response.status_code == 200
+    assert [post["slug"] for post in response.json()] == ["newer", "older"]
+
+
+def test_search_returns_empty_list_for_no_matches(tmp_path: Path) -> None:
+    write_note(
+        tmp_path / "published.md",
+        """
+        #publish
+
+        Nothing relevant here.
+        """,
+    )
+
+    client = make_app(tmp_path)
+    response = client.get("/posts/search", params={"q": "missing"})
+
+    assert response.status_code == 200
+    assert response.json() == []
+
+
+def test_search_rejects_missing_or_blank_queries(tmp_path: Path) -> None:
+    write_note(
+        tmp_path / "published.md",
+        """
+        #publish
+
+        Searchable text.
+        """,
+    )
+
+    client = make_app(tmp_path)
+
+    missing = client.get("/posts/search")
+    blank = client.get("/posts/search", params={"q": "   "})
+
+    assert missing.status_code == 400
+    assert blank.status_code == 400
+
+
+def test_search_excludes_unpublished_notes(tmp_path: Path) -> None:
+    write_note(
+        tmp_path / "public.md",
+        """
+        #publish
+
+        Public keyword.
+        """,
+    )
+    write_note(
+        tmp_path / "private.md",
+        """
+        Private keyword.
+        """,
+    )
+
+    client = make_app(tmp_path)
+    response = client.get("/posts/search", params={"q": "keyword"})
+
+    assert response.status_code == 200
+    assert [post["slug"] for post in response.json()] == ["public"]

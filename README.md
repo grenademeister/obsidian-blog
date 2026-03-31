@@ -33,7 +33,16 @@ Open:
 - `http://127.0.0.1:8000/`
 - `http://127.0.0.1:8000/health`
 - `http://127.0.0.1:8000/posts`
+- `http://127.0.0.1:8000/posts/search?q=frontmatter`
 - `http://127.0.0.1:8000/posts/with-frontmatter`
+
+Search:
+
+- `GET /posts/search?q=...`
+- Searches published posts only.
+- Matches case-insensitive substrings in `title`, `summary`, and `tags`.
+- Returns the same summary objects as `/posts`.
+- Returns `400` when `q` is missing or blank.
 
 Run tests:
 
