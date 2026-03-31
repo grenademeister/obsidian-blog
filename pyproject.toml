@@ -1,0 +1,17 @@
+[project]
+name = "2026-03-31-backend"
+version = "0.1.0"
+description = "FastAPI backend for publishing selected Obsidian notes"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "fastapi",
+    "mistune>=3.2.0",
+    "uvicorn[standard]",
+]
+
+[dependency-groups]
+dev = [
+    "httpx>=0.28.1",
+    "pytest>=9.0.2",
+]

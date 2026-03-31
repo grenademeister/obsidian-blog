@@ -1,0 +1,170 @@
+import sys
+import textwrap
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from fastapi.testclient import TestClient
+
+from main import Settings, create_app, load_posts
+
+
+def make_app(tmp_path: Path) -> TestClient:
+    app = create_app(Settings(vault_dir=tmp_path, cors_origins=["https://grenademeister.github.io"]))
+    return TestClient(app)
+
+
+def write_note(path: Path, content: str) -> None:
+    path.write_text(textwrap.dedent(content).strip() + "\n", encoding="utf-8")
+
+
+def test_health() -> None:
+    client = make_app(Path("stub_vault"))
+    response = client.get("/health")
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
+
+
+def test_posts_only_include_published_notes(tmp_path: Path) -> None:
+    write_note(
+        tmp_path / "published.md",
+        """
+        #publish #ai
+
+        Published body.
+        """,
+    )
+    write_note(tmp_path / "private.md", "Private body.")
+
+    client = make_app(tmp_path)
+    response = client.get("/posts")
+
+    assert response.status_code == 200
+    assert [post["slug"] for post in response.json()] == ["published"]
+
+
+def test_posts_are_sorted_by_date_descending_with_undated_last(tmp_path: Path) -> None:
+    write_note(
+        tmp_path / "older.md",
+        """
+        ---
+        date: 2026-03-01
+        ---
+
+        #publish
+
+        Older.
+        """,
+    )
+    write_note(
+        tmp_path / "newer.md",
+        """
+        ---
+        date: 2026-03-30
+        ---
+
+        #publish
+
+        Newer.
+        """,
+    )
+    write_note(
+        tmp_path / "undated.md",
+        """
+        #publish
+
+        No date here.
+        """,
+    )
+
+    posts = load_posts(tmp_path)
+
+    assert [post.slug for post in posts] == ["newer", "older", "undated"]
+
+
+def test_title_summary_and_tags_fallbacks(tmp_path: Path) -> None:
+    write_note(
+        tmp_path / "fallbacks.md",
+        """
+        #publish #ml #notes
+
+        # Derived Title
+
+        First paragraph becomes the summary.
+
+        Second paragraph.
+        """,
+    )
+
+    client = make_app(tmp_path)
+    response = client.get("/posts/fallbacks")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["title"] == "Derived Title"
+    assert payload["summary"] == "First paragraph becomes the summary."
+    assert payload["tags"] == ["ml", "notes"]
+
+
+def test_frontmatter_overrides_title_and_summary(tmp_path: Path) -> None:
+    write_note(
+        tmp_path / "frontmatter.md",
+        """
+        ---
+        title: Explicit Title
+        summary: Explicit summary
+        tags:
+          - ai
+        date: 2026-03-30
+        ---
+
+        #publish
+
+        # Ignored Heading
+
+        Body paragraph.
+        """,
+    )
+
+    client = make_app(tmp_path)
+    response = client.get("/posts/frontmatter")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["title"] == "Explicit Title"
+    assert payload["summary"] == "Explicit summary"
+    assert payload["tags"] == ["ai"]
+    assert payload["date"] == "2026-03-30"
+
+
+def test_post_detail_renders_html(tmp_path: Path) -> None:
+    write_note(
+        tmp_path / "rendered.md",
+        """
+        #publish
+
+        # Heading
+
+        Hello **world**.
+        """,
+    )
+
+    client = make_app(tmp_path)
+    response = client.get("/posts/rendered")
+
+    assert response.status_code == 200
+    assert "<strong>world</strong>" in response.json()["html"]
+
+
+def test_post_detail_404_for_missing_or_unpublished(tmp_path: Path) -> None:
+    write_note(tmp_path / "private.md", "No publish tag.")
+
+    client = make_app(tmp_path)
+
+    missing = client.get("/posts/missing")
+    private = client.get("/posts/private")
+
+    assert missing.status_code == 404
+    assert private.status_code == 404
