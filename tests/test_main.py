@@ -4,6 +4,7 @@ from datetime import datetime
 from pathlib import Path
 
 import os
+import pytest
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -11,7 +12,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from fastapi.testclient import TestClient
 
-from main import Settings, create_app, load_posts
+from main import Settings, create_app, get_cached_posts, load_posts, reset_post_cache
 
 
 def make_app(tmp_path: Path) -> TestClient:
@@ -27,6 +28,13 @@ def write_note(path: Path, content: str) -> None:
 def set_mtime(path: Path, timestamp: datetime) -> None:
     unix_time = timestamp.timestamp()
     os.utime(path, (unix_time, unix_time))
+
+
+@pytest.fixture(autouse=True)
+def clear_post_cache() -> None:
+    reset_post_cache()
+    yield
+    reset_post_cache()
 
 
 def test_health() -> None:
@@ -575,3 +583,163 @@ def test_missing_vault_returns_empty_posts_and_search_results(tmp_path: Path) ->
     assert posts_response.json() == []
     assert search_response.status_code == 200
     assert search_response.json() == []
+
+
+def test_get_cached_posts_reuses_cached_result_without_vault_changes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    write_note(
+        tmp_path / "published.md",
+        """
+        #publish
+
+        Cached content.
+        """,
+    )
+
+    call_count = 0
+    original = load_posts
+
+    def counting_load_posts(vault_dir: Path):
+        nonlocal call_count
+        call_count += 1
+        return original(vault_dir)
+
+    monkeypatch.setattr("main.load_posts", counting_load_posts)
+
+    first = get_cached_posts(tmp_path)
+    second = get_cached_posts(tmp_path)
+
+    assert [post.slug for post in first] == ["published"]
+    assert [post.slug for post in second] == ["published"]
+    assert call_count == 1
+
+
+def test_cache_invalidates_when_existing_file_changes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    note_path = tmp_path / "published.md"
+    write_note(
+        note_path,
+        """
+        #publish
+
+        First body.
+        """,
+    )
+    set_mtime(note_path, datetime(2026, 1, 1, 9, 0, 0))
+
+    call_count = 0
+    original = load_posts
+
+    def counting_load_posts(vault_dir: Path):
+        nonlocal call_count
+        call_count += 1
+        return original(vault_dir)
+
+    monkeypatch.setattr("main.load_posts", counting_load_posts)
+
+    first = get_cached_posts(tmp_path)
+    write_note(
+        note_path,
+        """
+        #publish
+
+        Updated body.
+        """,
+    )
+    set_mtime(note_path, datetime(2026, 1, 2, 9, 0, 0))
+    second = get_cached_posts(tmp_path)
+
+    assert first[0].summary == "First body."
+    assert second[0].summary == "Updated body."
+    assert call_count == 2
+
+
+def test_cache_invalidates_when_file_is_added(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    write_note(
+        tmp_path / "first.md",
+        """
+        #publish
+
+        First post.
+        """,
+    )
+
+    call_count = 0
+    original = load_posts
+
+    def counting_load_posts(vault_dir: Path):
+        nonlocal call_count
+        call_count += 1
+        return original(vault_dir)
+
+    monkeypatch.setattr("main.load_posts", counting_load_posts)
+
+    first = get_cached_posts(tmp_path)
+    write_note(
+        tmp_path / "second.md",
+        """
+        #publish
+
+        Second post.
+        """,
+    )
+    second = get_cached_posts(tmp_path)
+
+    assert [post.slug for post in first] == ["first"]
+    assert [post.slug for post in second] == ["second", "first"]
+    assert call_count == 2
+
+
+def test_cache_invalidates_when_file_is_deleted(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    first_path = tmp_path / "first.md"
+    second_path = tmp_path / "second.md"
+    write_note(first_path, "#publish\n\nFirst post.")
+    write_note(second_path, "#publish\n\nSecond post.")
+
+    call_count = 0
+    original = load_posts
+
+    def counting_load_posts(vault_dir: Path):
+        nonlocal call_count
+        call_count += 1
+        return original(vault_dir)
+
+    monkeypatch.setattr("main.load_posts", counting_load_posts)
+
+    first = get_cached_posts(tmp_path)
+    second_path.unlink()
+    second = get_cached_posts(tmp_path)
+
+    assert sorted(post.slug for post in first) == ["first", "second"]
+    assert [post.slug for post in second] == ["first"]
+    assert call_count == 2
+
+
+def test_all_read_endpoints_share_the_same_cached_load(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    write_note(
+        tmp_path / "shared.md",
+        """
+        #publish #topic
+
+        Shared cache body.
+        """,
+    )
+
+    call_count = 0
+    original = load_posts
+
+    def counting_load_posts(vault_dir: Path):
+        nonlocal call_count
+        call_count += 1
+        return original(vault_dir)
+
+    monkeypatch.setattr("main.load_posts", counting_load_posts)
+
+    client = make_app(tmp_path)
+
+    posts_response = client.get("/posts")
+    search_response = client.get("/posts/search", params={"q": "topic"})
+    detail_response = client.get("/posts/shared")
+
+    assert posts_response.status_code == 200
+    assert search_response.status_code == 200
+    assert detail_response.status_code == 200
+    assert call_count == 1

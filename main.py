@@ -51,6 +51,21 @@ class LoadedPost:
     html: str
 
 
+@dataclass(frozen=True)
+class FileFingerprint:
+    path: str
+    modified_time: float
+
+
+@dataclass
+class PostCache:
+    fingerprint: tuple[FileFingerprint, ...] | None = None
+    posts: list[LoadedPost] | None = None
+
+
+POST_CACHE = PostCache()
+
+
 def to_post_summary(post: LoadedPost) -> PostSummary:
     return PostSummary(
         title=post.title,
@@ -65,6 +80,11 @@ def parse_cors_origins(raw: str | None) -> list[str]:
     if not raw:
         return DEFAULT_CORS_ORIGINS
     return [origin.strip() for origin in raw.split(",") if origin.strip()]
+
+
+def reset_post_cache() -> None:
+    POST_CACHE.fingerprint = None
+    POST_CACHE.posts = None
 
 
 @lru_cache(maxsize=1)
@@ -274,6 +294,32 @@ def load_posts(vault_dir: Path) -> list[LoadedPost]:
     return posts
 
 
+def build_vault_fingerprint(vault_dir: Path) -> tuple[FileFingerprint, ...]:
+    if not vault_dir.exists():
+        return ()
+
+    fingerprints: list[FileFingerprint] = []
+    for path in sorted(vault_dir.rglob("*.md")):
+        try:
+            modified_time = path.stat().st_mtime
+        except OSError:
+            continue
+        fingerprints.append(FileFingerprint(path=str(path.resolve()), modified_time=modified_time))
+
+    return tuple(fingerprints)
+
+
+def get_cached_posts(vault_dir: Path) -> list[LoadedPost]:
+    fingerprint = build_vault_fingerprint(vault_dir)
+    if POST_CACHE.fingerprint == fingerprint and POST_CACHE.posts is not None:
+        return POST_CACHE.posts
+
+    posts = load_posts(vault_dir)
+    POST_CACHE.fingerprint = fingerprint
+    POST_CACHE.posts = posts
+    return posts
+
+
 def build_search_text(post: LoadedPost) -> str:
     parts = [post.title, post.summary, *post.tags]
     return " ".join(part.lower() for part in parts if part)
@@ -309,7 +355,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/posts", response_model=list[PostSummary])
     def list_posts() -> list[PostSummary]:
-        posts = load_posts(settings.vault_dir)
+        posts = get_cached_posts(settings.vault_dir)
         return [to_post_summary(post) for post in posts]
 
     @app.get("/posts/search", response_model=list[PostSummary])
@@ -317,12 +363,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if q is None or not q.strip():
             raise HTTPException(status_code=400, detail="Query parameter 'q' is required")
 
-        posts = load_posts(settings.vault_dir)
+        posts = get_cached_posts(settings.vault_dir)
         return [to_post_summary(post) for post in search_posts(posts, q)]
 
     @app.get("/posts/{slug}", response_model=PostDetail)
     def get_post(slug: str) -> PostDetail:
-        for post in load_posts(settings.vault_dir):
+        for post in get_cached_posts(settings.vault_dir):
             if post.slug == slug:
                 return PostDetail(
                     title=post.title,

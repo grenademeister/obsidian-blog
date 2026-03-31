@@ -2,7 +2,7 @@
 
 Small FastAPI backend for publishing selected Obsidian notes as a read-only blog API.
 
-The service reads Markdown files directly from a vault directory on disk, filters to public notes, converts Markdown to HTML, and exposes simple JSON endpoints for a static frontend.
+The service reads Markdown files from a vault directory on disk, filters to public notes, converts Markdown to HTML, and exposes simple JSON endpoints for a static frontend.
 
 ### What It Does
 
@@ -12,7 +12,8 @@ The service reads Markdown files directly from a vault directory on disk, filter
 - Returns post summaries through `/posts`.
 - Returns rendered post content through `/posts/{slug}`.
 - Provides simple substring search through `/posts/search?q=...`.
-- Uses direct disk reads on each request. No database, cache, or build step.
+- Uses direct disk reads when the vault changes, with an in-process cache between changes.
+- No database or build step.
 
 ### Quick Start
 
@@ -282,6 +283,25 @@ Current behavior:
 
 This keeps one bad note from breaking the whole API response.
 
+### Caching
+
+The backend uses a small in-process cache for parsed posts.
+
+Behavior:
+
+- The cache stores the parsed published post list in memory.
+- The cache key is derived from the set of Markdown files in the vault plus each file's modification time.
+- If the vault has not changed, `/posts`, `/posts/search`, and `/posts/{slug}` reuse the cached parsed posts.
+- If a Markdown file is added, edited, or deleted, the next request rebuilds the cache automatically.
+
+What this means operationally:
+
+- no database is required
+- no Redis is required
+- each server process keeps its own cache
+- there is no shared cache across multiple worker processes
+- the first request after a vault change pays the reload cost
+
 ### Stub Vault
 
 The repository ships with a development stub vault in [stub_vault](/home/grenade/workspace/tries/2026-03-31-backend/stub_vault).
@@ -320,9 +340,9 @@ Tests live in [tests/test_main.py](/home/grenade/workspace/tries/2026-03-31-back
 ### Development Notes
 
 - The backend is intentionally simple and synchronous.
-- It does not cache parsed notes.
-- It reparses the vault on every request.
-- This is appropriate for a small personal blog and easy to reason about.
+- It uses an in-process parsed-post cache keyed by file path and modification time.
+- It refreshes automatically on the next request after vault changes.
+- This is appropriate for a small personal blog and keeps the implementation simple.
 
 Current implementation choices:
 
@@ -356,7 +376,6 @@ Current limitations are intentional:
 - no fuzzy search
 - no authentication
 - no admin interface
-- no caching
 - no websocket or SSE updates
 
 This keeps the backend small and predictable.
