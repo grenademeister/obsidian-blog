@@ -1,9 +1,12 @@
+import hashlib
 import sys
+import tempfile
 import textwrap
 from datetime import datetime
 from pathlib import Path
 
 import os
+import sqlite3
 import pytest
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -15,8 +18,19 @@ from fastapi.testclient import TestClient
 from main import Settings, create_app, get_cached_posts, load_posts, reset_asset_cache, reset_post_cache
 
 
+def make_db_path(vault_dir: Path) -> Path:
+    digest = hashlib.sha1(str(vault_dir.resolve()).encode("utf-8")).hexdigest()[:12]
+    return Path(tempfile.gettempdir()) / f"obsidian-blog-test-{digest}.sqlite3"
+
+
 def make_app(tmp_path: Path) -> TestClient:
-    app = create_app(Settings(vault_dir=tmp_path, cors_origins=["https://grenademeister.github.io"]))
+    app = create_app(
+        Settings(
+            vault_dir=tmp_path,
+            cors_origins=["https://grenademeister.github.io"],
+            db_path=make_db_path(tmp_path),
+        )
+    )
     return TestClient(app)
 
 
@@ -79,6 +93,7 @@ def test_posts_only_include_published_notes(tmp_path: Path) -> None:
 
     assert response.status_code == 200
     assert [post["slug"] for post in response.json()] == ["published"]
+    assert response.json()[0]["view_count"] == 0
 
 
 def test_posts_are_sorted_by_date_descending_with_undated_last(tmp_path: Path) -> None:
@@ -193,6 +208,8 @@ def test_summary_and_tags_fallbacks_with_filename_title(tmp_path: Path) -> None:
     assert payload["title"] == "fallbacks"
     assert payload["summary"] == "First paragraph becomes the summary."
     assert payload["tags"] == ["ml", "notes"]
+    assert payload["view_count"] == 0
+    assert payload["comments"] == []
 
 
 def test_title_falls_back_to_slug_when_no_frontmatter_or_h1_exists(tmp_path: Path) -> None:
@@ -529,6 +546,182 @@ def test_post_detail_404_for_missing_or_unpublished(tmp_path: Path) -> None:
 
     assert missing.status_code == 404
     assert private.status_code == 404
+
+
+def test_startup_initializes_sqlite_schema(tmp_path: Path) -> None:
+    db_path = make_db_path(tmp_path)
+    client = make_app(tmp_path)
+
+    response = client.get("/health")
+
+    assert response.status_code == 200
+    assert db_path.exists()
+
+    with sqlite3.connect(db_path) as connection:
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+
+    assert "post_views" in tables
+    assert "comments" in tables
+
+
+def test_post_list_and_detail_include_default_db_fields(tmp_path: Path) -> None:
+    write_note(
+        tmp_path / "post.md",
+        """
+        #publish
+
+        Body.
+        """,
+    )
+
+    client = make_app(tmp_path)
+
+    posts_response = client.get("/posts")
+    detail_response = client.get("/posts/post")
+
+    assert posts_response.status_code == 200
+    assert posts_response.json()[0]["view_count"] == 0
+    assert detail_response.status_code == 200
+    assert detail_response.json()["view_count"] == 0
+    assert detail_response.json()["comments"] == []
+
+
+def test_post_view_endpoint_increments_persistently(tmp_path: Path) -> None:
+    write_note(
+        tmp_path / "post.md",
+        """
+        #publish
+
+        Body.
+        """,
+    )
+
+    client = make_app(tmp_path)
+
+    first = client.post("/posts/post/view")
+    second = client.post("/posts/post/view")
+    detail = client.get("/posts/post")
+    posts = client.get("/posts")
+
+    assert first.status_code == 200
+    assert first.json() == {"slug": "post", "view_count": 1}
+    assert second.status_code == 200
+    assert second.json() == {"slug": "post", "view_count": 2}
+    assert detail.json()["view_count"] == 2
+    assert posts.json()[0]["view_count"] == 2
+
+
+def test_post_view_endpoint_rejects_missing_or_unpublished_posts(tmp_path: Path) -> None:
+    write_note(tmp_path / "private.md", "Private.")
+    client = make_app(tmp_path)
+
+    missing = client.post("/posts/missing/view")
+    private = client.post("/posts/private/view")
+
+    assert missing.status_code == 404
+    assert private.status_code == 404
+
+
+def test_post_comment_creation_and_ordering(tmp_path: Path) -> None:
+    write_note(
+        tmp_path / "post.md",
+        """
+        #publish
+
+        Body.
+        """,
+    )
+
+    client = make_app(tmp_path)
+
+    first = client.post(
+        "/posts/post/comments",
+        json={"author_name": " Alice ", "body": " First comment. "},
+    )
+    second = client.post(
+        "/posts/post/comments",
+        json={"author_name": "Bob", "body": "Second comment."},
+    )
+    detail = client.get("/posts/post")
+
+    assert first.status_code == 200
+    assert first.json()["author_name"] == "Alice"
+    assert first.json()["body"] == "First comment."
+    assert second.status_code == 200
+    assert [comment["author_name"] for comment in detail.json()["comments"]] == ["Alice", "Bob"]
+    assert [comment["body"] for comment in detail.json()["comments"]] == ["First comment.", "Second comment."]
+
+
+def test_post_comment_creation_rejects_blank_fields(tmp_path: Path) -> None:
+    write_note(
+        tmp_path / "post.md",
+        """
+        #publish
+
+        Body.
+        """,
+    )
+
+    client = make_app(tmp_path)
+
+    blank_author = client.post(
+        "/posts/post/comments",
+        json={"author_name": "   ", "body": "Valid"},
+    )
+    blank_body = client.post(
+        "/posts/post/comments",
+        json={"author_name": "Valid", "body": "   "},
+    )
+
+    assert blank_author.status_code == 400
+    assert blank_body.status_code == 400
+
+
+def test_post_comment_creation_rejects_missing_or_unpublished_posts(tmp_path: Path) -> None:
+    write_note(tmp_path / "private.md", "Private.")
+    client = make_app(tmp_path)
+
+    missing = client.post(
+        "/posts/missing/comments",
+        json={"author_name": "A", "body": "Hello"},
+    )
+    private = client.post(
+        "/posts/private/comments",
+        json={"author_name": "A", "body": "Hello"},
+    )
+
+    assert missing.status_code == 404
+    assert private.status_code == 404
+
+
+def test_db_data_persists_across_app_instances(tmp_path: Path) -> None:
+    write_note(
+        tmp_path / "post.md",
+        """
+        #publish
+
+        Body.
+        """,
+    )
+
+    first_client = make_app(tmp_path)
+    first_client.post("/posts/post/view")
+    first_client.post(
+        "/posts/post/comments",
+        json={"author_name": "Alice", "body": "Persistent comment."},
+    )
+
+    second_client = make_app(tmp_path)
+    detail = second_client.get("/posts/post")
+
+    assert detail.status_code == 200
+    assert detail.json()["view_count"] == 1
+    assert [comment["body"] for comment in detail.json()["comments"]] == ["Persistent comment."]
 
 
 def test_search_matches_title_summary_and_tags(tmp_path: Path) -> None:

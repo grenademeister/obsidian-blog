@@ -14,7 +14,7 @@ The service reads Markdown files from a vault directory on disk, filters to publ
 - Serves local note images through `/media/...`.
 - Provides simple search through `/posts/search?q=...`.
 - Uses direct disk reads when the vault changes, with an in-process cache between changes.
-- No database or build step.
+- Stores view counts and comments in a small local SQLite database.
 
 ### Quick Start
 
@@ -51,6 +51,7 @@ The backend is configured with environment variables.
 ```bash
 export VAULT_DIR=./vault_copy
 export CORS_ORIGINS=https://grenademeister.github.io
+export DB_PATH=./data/blog.sqlite3
 ```
 
 Available settings:
@@ -63,6 +64,9 @@ Available settings:
   - Comma-separated list of allowed origins.
   - Default: `https://grenademeister.github.io`
   - Example: `http://localhost:5173,https://grenademeister.github.io`
+- `DB_PATH`
+  - Path to the SQLite database file used for view counts and comments.
+  - Default: `./data/blog.sqlite3`
 
 ### Content Model
 
@@ -196,14 +200,16 @@ Example response:
     "slug": "with-frontmatter",
     "date": "2026-03-30",
     "tags": ["ai", "notes"],
-    "summary": "Frontmatter summary for the list response."
+    "summary": "Frontmatter summary for the list response.",
+    "view_count": 12
   },
   {
     "title": "hello-world",
     "slug": "hello-world",
     "date": "2026-03-31",
     "tags": ["notes"],
-    "summary": "This is the first published post from the stub vault."
+    "summary": "This is the first published post from the stub vault.",
+    "view_count": 3
   }
 ]
 ```
@@ -228,7 +234,43 @@ Example response:
   "date": "2026-03-30",
   "tags": ["ai", "notes"],
   "summary": "Frontmatter summary for the list response.",
-  "html": "<p>Hello from the frontmatter-backed post.</p>\n<h2>Heading</h2>\n<p>More body content.</p>\n"
+  "view_count": 12,
+  "html": "<p>Hello from the frontmatter-backed post.</p>\n<h2>Heading</h2>\n<p>More body content.</p>\n",
+  "comments": [
+    {
+      "id": 1,
+      "post_slug": "with-frontmatter",
+      "author_name": "Alice",
+      "body": "Nice post.",
+      "created_at": "2026-04-03T09:15:00+00:00"
+    }
+  ]
+}
+```
+
+#### `POST /posts/{slug}/view`
+
+Increments the stored view count for a published post.
+
+Example response:
+
+```json
+{
+  "slug": "with-frontmatter",
+  "view_count": 13
+}
+```
+
+#### `POST /posts/{slug}/comments`
+
+Creates a public comment for a published post.
+
+Example request:
+
+```json
+{
+  "author_name": "Alice",
+  "body": "Nice post."
 }
 ```
 

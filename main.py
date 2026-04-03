@@ -4,10 +4,11 @@ import logging
 import mimetypes
 import os
 import re
+import sqlite3
 import textwrap
 from collections import defaultdict
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from functools import lru_cache
 from pathlib import Path
 from urllib.parse import quote
@@ -35,16 +36,37 @@ class PostSummary(BaseModel):
     date: str | None
     tags: list[str]
     summary: str
+    view_count: int
+
+
+class Comment(BaseModel):
+    id: int
+    post_slug: str
+    author_name: str
+    body: str
+    created_at: str
+
+
+class CommentCreate(BaseModel):
+    author_name: str
+    body: str
+
+
+class ViewCountResponse(BaseModel):
+    slug: str
+    view_count: int
 
 
 class PostDetail(PostSummary):
     html: str
+    comments: list[Comment]
 
 
 @dataclass(frozen=True)
 class Settings:
     vault_dir: Path
     cors_origins: list[str]
+    db_path: Path
 
 
 @dataclass(frozen=True)
@@ -87,6 +109,7 @@ def to_post_summary(post: LoadedPost) -> PostSummary:
         date=post.date,
         tags=post.tags,
         summary=post.summary,
+        view_count=0,
     )
 
 
@@ -111,6 +134,126 @@ def get_settings() -> Settings:
     return Settings(
         vault_dir=Path(os.getenv("VAULT_DIR", "./vault_copy")).resolve(),
         cors_origins=parse_cors_origins(os.getenv("CORS_ORIGINS")),
+        db_path=Path(os.getenv("DB_PATH", "./data/blog.sqlite3")).resolve(),
+    )
+
+
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def init_db(db_path: Path) -> None:
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS post_views (
+                post_slug TEXT PRIMARY KEY,
+                view_count INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS comments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                post_slug TEXT NOT NULL,
+                author_name TEXT NOT NULL,
+                body TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_comments_post_slug_created_at
+            ON comments (post_slug, created_at)
+            """
+        )
+
+
+def get_db_connection(db_path: Path) -> sqlite3.Connection:
+    init_db(db_path)
+    connection = sqlite3.connect(db_path)
+    connection.row_factory = sqlite3.Row
+    return connection
+
+
+def fetch_view_counts(db_path: Path, slugs: list[str]) -> dict[str, int]:
+    if not slugs:
+        return {}
+
+    placeholders = ", ".join("?" for _ in slugs)
+    with get_db_connection(db_path) as connection:
+        rows = connection.execute(
+            f"SELECT post_slug, view_count FROM post_views WHERE post_slug IN ({placeholders})",
+            slugs,
+        ).fetchall()
+
+    return {str(row["post_slug"]): int(row["view_count"]) for row in rows}
+
+
+def fetch_comments(db_path: Path, slug: str) -> list[Comment]:
+    with get_db_connection(db_path) as connection:
+        rows = connection.execute(
+            """
+            SELECT id, post_slug, author_name, body, created_at
+            FROM comments
+            WHERE post_slug = ?
+            ORDER BY created_at ASC, id ASC
+            """,
+            (slug,),
+        ).fetchall()
+
+    return [Comment.model_validate(dict(row)) for row in rows]
+
+
+def increment_view_count(db_path: Path, slug: str) -> int:
+    now = utc_now_iso()
+    with get_db_connection(db_path) as connection:
+        connection.execute(
+            """
+            INSERT INTO post_views (post_slug, view_count, updated_at)
+            VALUES (?, 1, ?)
+            ON CONFLICT(post_slug) DO UPDATE SET
+                view_count = post_views.view_count + 1,
+                updated_at = excluded.updated_at
+            """,
+            (slug, now),
+        )
+        row = connection.execute(
+            "SELECT view_count FROM post_views WHERE post_slug = ?",
+            (slug,),
+        ).fetchone()
+
+    return 0 if row is None else int(row["view_count"])
+
+
+def create_comment(db_path: Path, slug: str, payload: CommentCreate) -> Comment:
+    author_name = payload.author_name.strip()
+    body = payload.body.strip()
+    if not author_name:
+        raise HTTPException(status_code=400, detail="author_name must not be blank")
+    if not body:
+        raise HTTPException(status_code=400, detail="body must not be blank")
+
+    created_at = utc_now_iso()
+    with get_db_connection(db_path) as connection:
+        cursor = connection.execute(
+            """
+            INSERT INTO comments (post_slug, author_name, body, created_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (slug, author_name, body, created_at),
+        )
+
+    return Comment(
+        id=int(cursor.lastrowid),
+        post_slug=slug,
+        author_name=author_name,
+        body=body,
+        created_at=created_at,
     )
 
 
@@ -490,15 +633,24 @@ def search_posts(posts: list[LoadedPost], query: str) -> list[LoadedPost]:
     return [post for post in posts if normalized_query in build_search_text(post)]
 
 
-def create_app(settings: Settings | None = None) -> FastAPI:
+def require_post(posts: list[LoadedPost], slug: str) -> LoadedPost:
+    for post in posts:
+        if post.slug == slug:
+            return post
+    raise HTTPException(status_code=404, detail="Post not found")
+
+
+def create_app(settings: Settings | None = None, initialize_db: bool = True) -> FastAPI:
     settings = settings or get_settings()
+    if initialize_db:
+        init_db(settings.db_path)
 
     app = FastAPI(title="Obsidian Blog Backend")
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.cors_origins,
         allow_credentials=False,
-        allow_methods=["GET"],
+        allow_methods=["GET", "POST"],
         allow_headers=["*"],
     )
 
@@ -513,7 +665,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/posts", response_model=list[PostSummary])
     def list_posts() -> list[PostSummary]:
         posts = get_cached_posts(settings.vault_dir)
-        return [to_post_summary(post) for post in posts]
+        view_counts = fetch_view_counts(settings.db_path, [post.slug for post in posts])
+        return [
+            PostSummary(
+                title=post.title,
+                slug=post.slug,
+                date=post.date,
+                tags=post.tags,
+                summary=post.summary,
+                view_count=view_counts.get(post.slug, 0),
+            )
+            for post in posts
+        ]
 
     @app.get("/posts/search", response_model=list[PostSummary])
     def search_posts_endpoint(q: str | None = None) -> list[PostSummary]:
@@ -525,7 +688,29 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             matches = search_posts(posts, q)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        return [to_post_summary(post) for post in matches]
+        view_counts = fetch_view_counts(settings.db_path, [post.slug for post in matches])
+        return [
+            PostSummary(
+                title=post.title,
+                slug=post.slug,
+                date=post.date,
+                tags=post.tags,
+                summary=post.summary,
+                view_count=view_counts.get(post.slug, 0),
+            )
+            for post in matches
+        ]
+
+    @app.post("/posts/{slug}/view", response_model=ViewCountResponse)
+    def add_post_view(slug: str) -> ViewCountResponse:
+        require_post(get_cached_posts(settings.vault_dir), slug)
+        view_count = increment_view_count(settings.db_path, slug)
+        return ViewCountResponse(slug=slug, view_count=view_count)
+
+    @app.post("/posts/{slug}/comments", response_model=Comment)
+    def add_post_comment(slug: str, payload: CommentCreate) -> Comment:
+        require_post(get_cached_posts(settings.vault_dir), slug)
+        return create_comment(settings.db_path, slug, payload)
 
     @app.get("/media/by-name/{asset_name}")
     def get_media_by_name(asset_name: str) -> FileResponse:
@@ -548,22 +733,22 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/posts/{slug}", response_model=PostDetail)
     def get_post(slug: str) -> PostDetail:
-        for post in get_cached_posts(settings.vault_dir):
-            if post.slug == slug:
-                return PostDetail(
-                    title=post.title,
-                    slug=post.slug,
-                    date=post.date,
-                    tags=post.tags,
-                    summary=post.summary,
-                    html=post.html,
-                )
-        raise HTTPException(status_code=404, detail="Post not found")
+        post = require_post(get_cached_posts(settings.vault_dir), slug)
+        return PostDetail(
+            title=post.title,
+            slug=post.slug,
+            date=post.date,
+            tags=post.tags,
+            summary=post.summary,
+            view_count=fetch_view_counts(settings.db_path, [slug]).get(slug, 0),
+            html=post.html,
+            comments=fetch_comments(settings.db_path, slug),
+        )
 
     return app
 
 
-app = create_app()
+app = create_app(initialize_db=False)
 
 
 def main() -> None:
