@@ -74,7 +74,7 @@ def test_stub_vault_has_multiple_published_posts_and_hides_private_notes() -> No
     assert "private-note" not in slugs
     assert "hello-world" in slugs
     assert "with-frontmatter" in slugs
-    assert "deep-note" in slugs
+    assert "nested/deep-note" in slugs
 
 
 def test_posts_only_include_published_notes(tmp_path: Path) -> None:
@@ -411,7 +411,7 @@ def test_relative_markdown_image_renders_media_by_path_url(tmp_path: Path) -> No
     )
 
     client = make_app(tmp_path)
-    response = client.get("/posts/relative-image")
+    response = client.get("/posts/nested/relative-image")
 
     assert response.status_code == 200
     assert "/media/by-path/00_Meta/growth.png" in response.json()["html"]
@@ -488,7 +488,7 @@ def test_loader_reads_nested_markdown_files(tmp_path: Path) -> None:
 
     posts = load_posts(tmp_path)
 
-    assert [post.slug for post in posts] == ["deep-post"]
+    assert [post.slug for post in posts] == ["nested/path/deep-post"]
 
 
 def test_invalid_frontmatter_file_is_skipped_without_breaking_other_posts(tmp_path: Path) -> None:
@@ -546,6 +546,91 @@ def test_post_detail_404_for_missing_or_unpublished(tmp_path: Path) -> None:
 
     assert missing.status_code == 404
     assert private.status_code == 404
+
+
+def test_duplicate_basenames_use_unique_vault_relative_slugs(tmp_path: Path) -> None:
+    write_note(
+        tmp_path / "alpha" / "shared.md",
+        """
+        ---
+        date: 2026-03-31
+        ---
+
+        #publish #common
+
+        Alpha content.
+        """,
+    )
+    write_note(
+        tmp_path / "beta team" / "shared.md",
+        """
+        ---
+        date: 2026-03-30
+        ---
+
+        #publish #common
+
+        Beta content.
+        """,
+    )
+
+    client = make_app(tmp_path)
+
+    posts_response = client.get("/posts")
+    alpha_detail = client.get("/posts/alpha/shared")
+    beta_detail = client.get("/posts/beta%20team/shared")
+    search_response = client.get("/posts/search", params={"q": "common"})
+    first_view = client.post("/posts/alpha/shared/view")
+    second_view = client.post("/posts/beta%20team/shared/view")
+    first_comment = client.post(
+        "/posts/alpha/shared/comments",
+        json={"author_name": "Alice", "body": "Alpha comment."},
+    )
+    second_comment = client.post(
+        "/posts/beta%20team/shared/comments",
+        json={"author_name": "Bob", "body": "Beta comment."},
+    )
+
+    assert posts_response.status_code == 200
+    assert [post["slug"] for post in posts_response.json()] == ["alpha/shared", "beta team/shared"]
+    assert alpha_detail.status_code == 200
+    assert alpha_detail.json()["summary"] == "Alpha content."
+    assert beta_detail.status_code == 200
+    assert beta_detail.json()["summary"] == "Beta content."
+    assert [post["slug"] for post in search_response.json()] == ["alpha/shared", "beta team/shared"]
+    assert first_view.json() == {"slug": "alpha/shared", "view_count": 1}
+    assert second_view.json() == {"slug": "beta team/shared", "view_count": 1}
+    assert first_comment.json()["post_slug"] == "alpha/shared"
+    assert second_comment.json()["post_slug"] == "beta team/shared"
+    assert [comment["body"] for comment in client.get("/posts/alpha/shared").json()["comments"]] == ["Alpha comment."]
+    assert [comment["body"] for comment in client.get("/posts/beta%20team/shared").json()["comments"]] == ["Beta comment."]
+
+
+def test_path_like_slug_routes_support_spaces_and_slashes(tmp_path: Path) -> None:
+    write_note(
+        tmp_path / "nested folder" / "space note.md",
+        """
+        #publish
+
+        Route content.
+        """,
+    )
+
+    client = make_app(tmp_path)
+
+    detail = client.get("/posts/nested%20folder/space%20note")
+    first_view = client.post("/posts/nested%20folder/space%20note/view")
+    comment = client.post(
+        "/posts/nested%20folder/space%20note/comments",
+        json={"author_name": "Casey", "body": "Works."},
+    )
+
+    assert detail.status_code == 200
+    assert detail.json()["slug"] == "nested folder/space note"
+    assert first_view.status_code == 200
+    assert first_view.json() == {"slug": "nested folder/space note", "view_count": 1}
+    assert comment.status_code == 200
+    assert comment.json()["post_slug"] == "nested folder/space note"
 
 
 def test_startup_initializes_sqlite_schema(tmp_path: Path) -> None:

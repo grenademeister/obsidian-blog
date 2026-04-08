@@ -344,6 +344,10 @@ def extract_title(fallback: str) -> str:
     return fallback
 
 
+def slug_for_path(path: Path, vault_dir: Path) -> str:
+    return path.relative_to(vault_dir).with_suffix("").as_posix()
+
+
 def body_to_plain_paragraphs(body: str) -> list[str]:
     paragraphs: list[str] = []
     for chunk in re.split(r"\n\s*\n", body):
@@ -492,7 +496,7 @@ def parse_post(path: Path, renderer: mistune.Markdown, vault_dir: Path) -> Loade
     date_value, sort_date = normalize_date(metadata.get("date"))
     if date_value is None or sort_date is None:
         date_value, sort_date = file_date(path)
-    slug = path.stem
+    slug = slug_for_path(path, vault_dir)
     title = extract_title(slug)
     summary = extract_summary(metadata, body)
     html = renderer(render_body)
@@ -701,13 +705,13 @@ def create_app(settings: Settings | None = None, initialize_db: bool = True) -> 
             for post in matches
         ]
 
-    @app.post("/posts/{slug}/view", response_model=ViewCountResponse)
+    @app.post("/posts/{slug:path}/view", response_model=ViewCountResponse)
     def add_post_view(slug: str) -> ViewCountResponse:
         require_post(get_cached_posts(settings.vault_dir), slug)
         view_count = increment_view_count(settings.db_path, slug)
         return ViewCountResponse(slug=slug, view_count=view_count)
 
-    @app.post("/posts/{slug}/comments", response_model=Comment)
+    @app.post("/posts/{slug:path}/comments", response_model=Comment)
     def add_post_comment(slug: str, payload: CommentCreate) -> Comment:
         require_post(get_cached_posts(settings.vault_dir), slug)
         return create_comment(settings.db_path, slug, payload)
@@ -731,7 +735,7 @@ def create_app(settings: Settings | None = None, initialize_db: bool = True) -> 
         path = resolve_media_path(settings.vault_dir, Path(asset_path))
         return build_file_response(path)
 
-    @app.get("/posts/{slug}", response_model=PostDetail)
+    @app.get("/posts/{slug:path}", response_model=PostDetail)
     def get_post(slug: str) -> PostDetail:
         post = require_post(get_cached_posts(settings.vault_dir), slug)
         return PostDetail(
