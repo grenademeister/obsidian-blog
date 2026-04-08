@@ -342,6 +342,75 @@ def test_post_detail_preserves_single_line_breaks_as_br(tmp_path: Path) -> None:
     assert "first line<br />" in response.json()["html"]
 
 
+def test_post_detail_escapes_raw_html_and_scripts(tmp_path: Path) -> None:
+    write_note(
+        tmp_path / "unsafe-html.md",
+        """
+        #publish
+
+        <script>alert("xss")</script>
+        <img src="https://example.com/x.png" onerror="alert('xss')" />
+        """,
+    )
+
+    client = make_app(tmp_path)
+    response = client.get("/posts/unsafe-html")
+
+    assert response.status_code == 200
+    html = response.json()["html"]
+    assert "<script>" not in html
+    assert "&lt;script&gt;alert" in html
+    assert "<img " not in html
+    assert " onerror=" in html
+    assert "&lt;img src=" in html
+    assert "&lt;/script&gt;" in html
+
+
+def test_post_detail_escapes_raw_html_attributes_and_inline_tags(tmp_path: Path) -> None:
+    write_note(
+        tmp_path / "unsafe-attrs.md",
+        """
+        #publish
+
+        <div onclick="alert('xss')">raw html</div>
+
+        Prefix <span data-unsafe="yes">inline html</span> suffix.
+        """,
+    )
+
+    client = make_app(tmp_path)
+    response = client.get("/posts/unsafe-attrs")
+
+    assert response.status_code == 200
+    html = response.json()["html"]
+    assert "<div" not in html
+    assert "<span" not in html
+    assert "&lt;div onclick=" in html
+    assert "&lt;span data-unsafe=" in html
+    assert "Prefix &lt;span data-unsafe=&quot;yes&quot;&gt;inline html&lt;/span&gt; suffix." in html
+
+
+def test_post_detail_rejects_unsafe_link_schemes(tmp_path: Path) -> None:
+    write_note(
+        tmp_path / "unsafe-links.md",
+        """
+        #publish
+
+        [bad](javascript:alert('xss'))
+        [mail](mailto:test@example.com)
+        """,
+    )
+
+    client = make_app(tmp_path)
+    response = client.get("/posts/unsafe-links")
+
+    assert response.status_code == 200
+    html = response.json()["html"]
+    assert 'href="javascript:alert' not in html
+    assert ">bad</a>" not in html
+    assert 'href="mailto:test@example.com"' in html
+
+
 def test_tag_only_lines_are_not_rendered_into_html(tmp_path: Path) -> None:
     write_note(
         tmp_path / "tag-lines.md",
@@ -432,6 +501,48 @@ def test_remote_markdown_image_url_is_left_unchanged(tmp_path: Path) -> None:
 
     assert response.status_code == 200
     assert 'src="https://example.com/image.png"' in response.json()["html"]
+
+
+def test_post_detail_renders_code_tables_blockquotes_and_external_links(tmp_path: Path) -> None:
+    write_note(
+        tmp_path / "technical-writing.md",
+        """
+        #publish
+
+        Here is `inline code`.
+
+        ```python
+        print("hello")
+        ```
+
+        > Quoted note.
+
+        | Col A | Col B |
+        | --- | --- |
+        | 1 | 2 |
+
+        [Docs](https://example.com/docs)
+        """,
+    )
+
+    client = make_app(tmp_path)
+    response = client.get("/posts/technical-writing")
+
+    assert response.status_code == 200
+    html = response.json()["html"]
+    assert '<code class="inline-code">inline code</code>' in html
+    assert '<pre class="code-block"><code class="language-python">' in html
+    assert "print(&quot;hello&quot;)" in html
+    assert "</code></pre>" in html
+    assert '<blockquote class="prose-quote">' in html
+    assert '<div class="table-scroll"><table>' in html
+    assert "<thead>" in html
+    assert "<tbody>" in html
+    assert "<th>Col A</th>" in html
+    assert "<td>2</td>" in html
+    assert 'href="https://example.com/docs"' in html
+    assert 'target="_blank"' in html
+    assert 'rel="noopener noreferrer nofollow"' in html
 
 
 def test_media_by_name_serves_image_bytes(tmp_path: Path) -> None:

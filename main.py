@@ -10,8 +10,9 @@ from collections import defaultdict
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from functools import lru_cache
+from html import escape
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 import mistune
 import uvicorn
@@ -28,6 +29,8 @@ OBSIDIAN_IMAGE_PATTERN = re.compile(r"!\[\[([^\]]+)\]\]")
 MARKDOWN_IMAGE_PATTERN = re.compile(r"!\[([^\]]*)\]\(([^)]+)\)")
 DEFAULT_CORS_ORIGINS = ["https://grenademeister.github.io"]
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".svg"}
+SAFE_LINK_SCHEMES = {"http", "https", "mailto"}
+SAFE_IMAGE_SCHEMES = {"http", "https"}
 
 
 class PostSummary(BaseModel):
@@ -413,7 +416,96 @@ def combine_tags(metadata: dict, body: str) -> tuple[list[str], bool]:
 
 
 def build_markdown_renderer() -> mistune.Markdown:
-    return mistune.create_markdown(hard_wrap=True, escape=False)
+    return mistune.create_markdown(
+        renderer=BlogRenderer(),
+        hard_wrap=True,
+        escape=True,
+        plugins=["table", "url", "strikethrough"],
+    )
+
+
+def is_safe_url(url: str, *, allowed_schemes: set[str], allow_relative: bool) -> bool:
+    candidate = url.strip()
+    if not candidate:
+        return False
+    if candidate.startswith(("data:", "javascript:", "vbscript:")):
+        return False
+
+    parsed = urlparse(candidate)
+    if parsed.scheme:
+        return parsed.scheme.lower() in allowed_schemes
+
+    if not allow_relative:
+        return False
+
+    return candidate.startswith(("/", "./", "../", "#"))
+
+
+def image_markdown(alt: str, url: str, title: str | None = None) -> str:
+    escaped_alt = alt.replace("[", r"\[").replace("]", r"\]")
+    escaped_url = url.replace(" ", "%20")
+    if title:
+        escaped_title = title.replace('"', '\\"')
+        return f'![{escaped_alt}]({escaped_url} "{escaped_title}")'
+    return f"![{escaped_alt}]({escaped_url})"
+
+
+class BlogRenderer(mistune.HTMLRenderer):
+    def inline_html(self, html: str) -> str:
+        return escape(html)
+
+    def block_html(self, html: str) -> str:
+        return f"{escape(html)}\n"
+
+    def link(self, text: str, url: str, title: str | None = None) -> str:
+        if not is_safe_url(url, allowed_schemes=SAFE_LINK_SCHEMES, allow_relative=True):
+            return escape(text or url)
+
+        attrs = [f'href="{escape(url, quote=True)}"']
+        if title:
+            attrs.append(f'title="{escape(title, quote=True)}"')
+
+        parsed = urlparse(url)
+        if parsed.scheme in {"http", "https"}:
+            attrs.append('target="_blank"')
+            attrs.append('rel="noopener noreferrer nofollow"')
+
+        return f"<a {' '.join(attrs)}>{text}</a>"
+
+    def image(self, text: str, url: str, title: str | None = None) -> str:
+        if not is_safe_url(url, allowed_schemes=SAFE_IMAGE_SCHEMES, allow_relative=True):
+            return escape(text or "")
+
+        attrs = [
+            f'src="{escape(url, quote=True)}"',
+            f'alt="{escape(text or "", quote=True)}"',
+        ]
+        if title:
+            width_match = re.fullmatch(r"width=(\d+)", title.strip())
+            if width_match:
+                attrs.append(f'width="{width_match.group(1)}"')
+            else:
+                attrs.append(f'title="{escape(title, quote=True)}"')
+
+        return f"<img {' '.join(attrs)} />"
+
+    def block_code(self, code: str, info: str | None = None) -> str:
+        language = ""
+        if info:
+            language = info.strip().split(None, 1)[0]
+
+        code_class = f' class="language-{escape(language, quote=True)}"' if language else ""
+        pre_class = " class=\"code-block\""
+        return f"<pre{pre_class}><code{code_class}>{escape(code)}</code></pre>\n"
+
+    def codespan(self, text: str) -> str:
+        return f'<code class="inline-code">{escape(text)}</code>'
+
+    def block_quote(self, text: str) -> str:
+        return f'<blockquote class="prose-quote">{text}</blockquote>\n'
+
+    def table(self, text: str) -> str:
+        return f'<div class="table-scroll"><table>{text}</table></div>\n'
 
 
 def media_url_for_name(asset_name: str) -> str:
@@ -453,9 +545,8 @@ def replace_obsidian_images(body: str) -> str:
         width = next((part for part in parts[1:] if part.isdigit()), None)
         alt = Path(asset_ref).stem
         url = media_url_for_name(asset_ref)
-        if width:
-            return f'<img src="{url}" alt="{alt}" width="{width}" />'
-        return f'<img src="{url}" alt="{alt}" />'
+        title = f"width={width}" if width else None
+        return image_markdown(alt, url, title)
 
     return OBSIDIAN_IMAGE_PATTERN.sub(replacement, body)
 
