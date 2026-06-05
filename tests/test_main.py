@@ -229,6 +229,23 @@ def test_title_falls_back_to_slug_when_no_frontmatter_or_h1_exists(tmp_path: Pat
     assert response.json()["title"] == "slug-title"
 
 
+def test_nested_post_title_does_not_include_parent_directories(tmp_path: Path) -> None:
+    write_note(
+        tmp_path / "nested" / "deep-note.md",
+        """
+        #publish
+
+        Plain body without a heading.
+        """,
+    )
+
+    client = make_app(tmp_path)
+    response = client.get("/posts/nested/deep-note")
+
+    assert response.status_code == 200
+    assert response.json()["title"] == "deep-note"
+
+
 def test_summary_is_truncated_for_long_first_paragraph(tmp_path: Path) -> None:
     long_text = "A" * 220
     write_note(

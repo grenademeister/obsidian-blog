@@ -12,6 +12,7 @@ from datetime import date, datetime, timezone
 from functools import lru_cache
 from html import escape
 from pathlib import Path
+from pathlib import PurePosixPath
 from urllib.parse import quote, urlparse
 
 import mistune
@@ -344,7 +345,9 @@ def normalize_frontmatter_tags(value: object) -> list[str]:
 
 
 def extract_title(fallback: str) -> str:
-    return fallback
+    if not fallback:
+        return fallback
+    return PurePosixPath(fallback).name
 
 
 def slug_for_path(path: Path, vault_dir: Path) -> str:
