@@ -41,6 +41,7 @@ class PostSummary(BaseModel):
     tags: list[str]
     summary: str
     view_count: int
+    thumbnail_id: str | None
 
 
 class Comment(BaseModel):
@@ -81,6 +82,7 @@ class LoadedPost:
     sort_date: date | None
     tags: list[str]
     summary: str
+    thumbnail_id: str | None
     html: str
 
 
@@ -114,6 +116,7 @@ def to_post_summary(post: LoadedPost) -> PostSummary:
         tags=post.tags,
         summary=post.summary,
         view_count=0,
+        thumbnail_id=post.thumbnail_id,
     )
 
 
@@ -537,6 +540,78 @@ def resolve_relative_asset_path(note_path: Path, raw_src: str, vault_dir: Path) 
     return relative
 
 
+def clean_local_image_ref(raw_ref: object) -> str | None:
+    if not isinstance(raw_ref, str):
+        return None
+
+    cleaned = raw_ref.strip().strip("<>")
+    if not cleaned:
+        return None
+    cleaned = cleaned.split("|", 1)[0].strip()
+    cleaned = cleaned.split("#", 1)[0].strip()
+    if not cleaned:
+        return None
+    if re.match(r"^[a-z]+:", cleaned, re.IGNORECASE) or cleaned.startswith(("/", "#", "blob:")):
+        return None
+    return cleaned
+
+
+def resolve_asset_reference(note_path: Path, raw_ref: object, vault_dir: Path) -> Path | None:
+    cleaned = clean_local_image_ref(raw_ref)
+    if cleaned is None:
+        return None
+
+    candidate = Path(cleaned)
+    if candidate.is_absolute() or not is_image_path(candidate):
+        return None
+
+    vault_root = vault_dir.resolve()
+    if ".." not in candidate.parts and len(candidate.parts) > 1:
+        resolved = (vault_root / candidate).resolve()
+        try:
+            relative = resolved.relative_to(vault_root)
+        except ValueError:
+            return None
+        if resolved.is_file():
+            return relative
+
+    if ".." not in candidate.parts and len(candidate.parts) == 1:
+        matches = build_asset_index(vault_dir).get(candidate.name, [])
+        if matches:
+            return matches[0]
+
+    relative = resolve_relative_asset_path(note_path, cleaned, vault_dir)
+    if relative is None:
+        return None
+    if (vault_root / relative).is_file():
+        return relative
+    return None
+
+
+def first_local_body_image(note_path: Path, body: str, vault_dir: Path) -> Path | None:
+    refs: list[tuple[int, str]] = []
+    refs.extend((match.start(), match.group(1)) for match in OBSIDIAN_IMAGE_PATTERN.finditer(body))
+    refs.extend((match.start(), match.group(2)) for match in MARKDOWN_IMAGE_PATTERN.finditer(body))
+
+    for _, raw_ref in sorted(refs, key=lambda item: item[0]):
+        relative = resolve_asset_reference(note_path, raw_ref, vault_dir)
+        if relative is not None:
+            return relative
+
+    return None
+
+
+def thumbnail_id_for_post(metadata: dict, body: str, note_path: Path, vault_dir: Path) -> str | None:
+    frontmatter_thumbnail = resolve_asset_reference(note_path, metadata.get("thumbnail"), vault_dir)
+    if frontmatter_thumbnail is not None:
+        return frontmatter_thumbnail.as_posix()
+
+    body_thumbnail = first_local_body_image(note_path, body, vault_dir)
+    if body_thumbnail is not None:
+        return body_thumbnail.as_posix()
+    return None
+
+
 def replace_obsidian_images(body: str) -> str:
     def replacement(match: re.Match[str]) -> str:
         inner = match.group(1).strip()
@@ -593,6 +668,7 @@ def parse_post(path: Path, renderer: mistune.Markdown, vault_dir: Path) -> Loade
     slug = slug_for_path(path, vault_dir)
     title = extract_title(slug)
     summary = extract_summary(metadata, body)
+    thumbnail_id = thumbnail_id_for_post(metadata, body, path, vault_dir)
     html = renderer(render_body)
 
     return LoadedPost(
@@ -602,6 +678,7 @@ def parse_post(path: Path, renderer: mistune.Markdown, vault_dir: Path) -> Loade
         sort_date=sort_date,
         tags=tags,
         summary=summary,
+        thumbnail_id=thumbnail_id,
         html=html,
     )
 
@@ -772,6 +849,7 @@ def create_app(settings: Settings | None = None, initialize_db: bool = True) -> 
                 tags=post.tags,
                 summary=post.summary,
                 view_count=view_counts.get(post.slug, 0),
+                thumbnail_id=post.thumbnail_id,
             )
             for post in posts
         ]
@@ -795,6 +873,7 @@ def create_app(settings: Settings | None = None, initialize_db: bool = True) -> 
                 tags=post.tags,
                 summary=post.summary,
                 view_count=view_counts.get(post.slug, 0),
+                thumbnail_id=post.thumbnail_id,
             )
             for post in matches
         ]
@@ -829,6 +908,11 @@ def create_app(settings: Settings | None = None, initialize_db: bool = True) -> 
         path = resolve_media_path(settings.vault_dir, Path(asset_path))
         return build_file_response(path)
 
+    @app.get("/thumbnail/{thumbnail_id:path}")
+    def get_thumbnail(thumbnail_id: str) -> FileResponse:
+        path = resolve_media_path(settings.vault_dir, Path(thumbnail_id))
+        return build_file_response(path)
+
     @app.get("/posts/{slug:path}", response_model=PostDetail)
     def get_post(slug: str) -> PostDetail:
         post = require_post(get_cached_posts(settings.vault_dir), slug)
@@ -839,6 +923,7 @@ def create_app(settings: Settings | None = None, initialize_db: bool = True) -> 
             tags=post.tags,
             summary=post.summary,
             view_count=fetch_view_counts(settings.db_path, [slug]).get(slug, 0),
+            thumbnail_id=post.thumbnail_id,
             html=post.html,
             comments=fetch_comments(settings.db_path, slug),
         )

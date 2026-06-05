@@ -520,6 +520,132 @@ def test_remote_markdown_image_url_is_left_unchanged(tmp_path: Path) -> None:
     assert 'src="https://example.com/image.png"' in response.json()["html"]
 
 
+def test_posts_include_thumbnail_id_from_frontmatter_filename(tmp_path: Path) -> None:
+    write_binary(tmp_path / "00_Meta" / "cover.jpg", b"fake-jpg")
+    write_note(
+        tmp_path / "thumb-note.md",
+        """
+        ---
+        thumbnail: cover.jpg
+        summary: Find me.
+        ---
+
+        #publish
+
+        Body.
+        """,
+    )
+
+    client = make_app(tmp_path)
+    posts_response = client.get("/posts")
+    search_response = client.get("/posts/search?q=find")
+    detail_response = client.get("/posts/thumb-note")
+
+    assert posts_response.status_code == 200
+    assert posts_response.json()[0]["thumbnail_id"] == "00_Meta/cover.jpg"
+    assert search_response.status_code == 200
+    assert search_response.json()[0]["thumbnail_id"] == "00_Meta/cover.jpg"
+    assert detail_response.status_code == 200
+    assert detail_response.json()["thumbnail_id"] == "00_Meta/cover.jpg"
+
+
+def test_frontmatter_thumbnail_supports_vault_relative_path(tmp_path: Path) -> None:
+    write_binary(tmp_path / "images" / "cover.png", b"fake-png")
+    write_note(
+        tmp_path / "thumb-note.md",
+        """
+        ---
+        thumbnail: images/cover.png
+        ---
+
+        #publish
+
+        Body.
+        """,
+    )
+
+    client = make_app(tmp_path)
+    response = client.get("/posts/thumb-note")
+
+    assert response.status_code == 200
+    assert response.json()["thumbnail_id"] == "images/cover.png"
+
+
+def test_missing_frontmatter_thumbnail_falls_back_to_first_local_body_image(tmp_path: Path) -> None:
+    write_binary(tmp_path / "images" / "first.png", b"first")
+    write_binary(tmp_path / "images" / "second.jpg", b"second")
+    write_note(
+        tmp_path / "nested" / "body-thumb.md",
+        """
+        ---
+        thumbnail: missing.png
+        ---
+
+        #publish
+
+        ![First](../images/first.png)
+        ![[second.jpg]]
+        """,
+    )
+
+    client = make_app(tmp_path)
+    response = client.get("/posts/nested/body-thumb")
+
+    assert response.status_code == 200
+    assert response.json()["thumbnail_id"] == "images/first.png"
+
+
+def test_remote_images_do_not_become_thumbnails(tmp_path: Path) -> None:
+    write_note(
+        tmp_path / "remote-thumb.md",
+        """
+        ---
+        thumbnail: https://example.com/cover.jpg
+        ---
+
+        #publish
+
+        ![Remote](https://example.com/image.png)
+        """,
+    )
+
+    client = make_app(tmp_path)
+    response = client.get("/posts/remote-thumb")
+
+    assert response.status_code == 200
+    assert response.json()["thumbnail_id"] is None
+
+
+def test_thumbnail_endpoint_serves_image_bytes(tmp_path: Path) -> None:
+    image_bytes = b"fake-thumbnail-data"
+    write_binary(tmp_path / "00_Meta" / "cover.jpg", image_bytes)
+
+    client = make_app(tmp_path)
+    response = client.get("/thumbnail/00_Meta/cover.jpg")
+
+    assert response.status_code == 200
+    assert response.content == image_bytes
+    assert response.headers["content-type"].startswith("image/jpeg")
+
+
+def test_thumbnail_endpoint_rejects_traversal_and_non_image_files(tmp_path: Path) -> None:
+    write_note(
+        tmp_path / "plain.md",
+        """
+        #publish
+
+        Body.
+        """,
+    )
+
+    client = make_app(tmp_path)
+    traversal = client.get("/thumbnail/../plain.md")
+    non_image = client.get("/thumbnail/plain.md")
+
+    assert traversal.status_code == 404
+    assert non_image.status_code == 404
+
+
 def test_post_detail_renders_code_tables_blockquotes_and_external_links(tmp_path: Path) -> None:
     write_note(
         tmp_path / "technical-writing.md",

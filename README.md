@@ -11,7 +11,7 @@ The service reads Markdown files from a vault directory on disk, filters to publ
 - Publishes only notes containing `#publish`.
 - Returns post summaries through `/posts`.
 - Returns rendered post content through `/posts/{slug}`.
-- Serves local note images through `/media/...`.
+- Serves local note images through `/media/...` and post thumbnails through `/thumbnail/...`.
 - Provides simple search through `/posts/search?q=...`.
 - Uses direct disk reads when the vault changes, with an in-process cache between changes.
 - Stores view counts and comments in a small local SQLite database.
@@ -82,6 +82,7 @@ tags:
   - ai
   - notes
 summary: Short preview text.
+thumbnail: 00_Meta/cover.jpg
 ---
 
 #publish #research
@@ -97,6 +98,8 @@ Image references currently supported:
 - Obsidian embeds with width such as `![[sample.jpg|200]]`
 - Standard Markdown local images such as `![Alt](../../00_Meta/growth.png)`
 - Standard Markdown remote images such as `![Alt](https://example.com/image.png)`
+
+Thumbnails are local vault images. A published note may set `thumbnail` in frontmatter using either a vault-relative path such as `00_Meta/cover.jpg` or a filename such as `cover.jpg`. If `thumbnail` is missing or invalid, the backend uses the first local image reference in the note body. Remote images are never used as thumbnails.
 
 #### Publish Rule
 
@@ -132,6 +135,10 @@ For each published note, the backend derives fields using these rules:
   - Otherwise the first non-empty body paragraph.
   - Headings and tag-only lines are ignored when building the fallback summary.
   - Long fallback summaries are truncated to 180 characters with `...`.
+- `thumbnail_id`
+  - Frontmatter `thumbnail` if it resolves to a local vault image.
+  - Otherwise the first local image reference in the body.
+  - Returned as a vault-relative image path, or `null` when no local thumbnail exists.
 - `html`
   - Generated from the Markdown body using `mistune`.
   - Tag-only lines such as `#publish #ai` are removed before rendering.
@@ -201,7 +208,8 @@ Example response:
     "date": "2026-03-30",
     "tags": ["ai", "notes"],
     "summary": "Frontmatter summary for the list response.",
-    "view_count": 12
+    "view_count": 12,
+    "thumbnail_id": "00_Meta/cover.jpg"
   },
   {
     "title": "hello-world",
@@ -209,7 +217,8 @@ Example response:
     "date": "2026-03-31",
     "tags": ["notes"],
     "summary": "This is the first published post from the stub vault.",
-    "view_count": 3
+    "view_count": 3,
+    "thumbnail_id": null
   }
 ]
 ```
@@ -235,6 +244,7 @@ Example response:
   "tags": ["ai", "notes"],
   "summary": "Frontmatter summary for the list response.",
   "view_count": 12,
+  "thumbnail_id": "00_Meta/cover.jpg",
   "html": "<p>Hello from the frontmatter-backed post.</p>\n<h2>Heading</h2>\n<p>More body content.</p>\n",
   "comments": [
     {
@@ -304,6 +314,23 @@ Example:
 
 ```text
 /media/by-path/00_Meta/growth.png
+```
+
+#### `GET /thumbnail/{thumbnail_id}`
+
+Serves the local image identified by a post response `thumbnail_id`.
+
+Behavior:
+
+- `thumbnail_id` is a vault-relative image path.
+- Only image extensions are allowed.
+- Absolute paths and path traversal are rejected.
+- Returns `404` if the image does not exist.
+
+Example:
+
+```text
+/thumbnail/00_Meta/cover.jpg
 ```
 
 #### `GET /posts/search?q=...`

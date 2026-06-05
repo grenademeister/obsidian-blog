@@ -74,10 +74,16 @@ Hello
     "slug": "my-post",
     "date": "2026-03-30",
     "tags": ["ai", "notes"],
-    "summary": "Short preview"
+    "summary": "Short preview",
+    "thumbnail_id": "00_Meta/cover.jpg"
   }
 ]
 ```
+
+**GET `/thumbnail/{thumbnail_id}`**
+
+* Returns local thumbnail image bytes for a vault-relative `thumbnail_id`
+* Returns `404` for missing files, non-images, absolute paths, or traversal
 
 **GET `/posts/{slug}`**
 
@@ -90,6 +96,8 @@ Hello
   "slug": "my-post",
   "date": "2026-03-30",
   "tags": ["ai", "notes"],
+  "summary": "Short preview",
+  "thumbnail_id": "00_Meta/cover.jpg",
   "html": "<p>Hello world</p>"
 }
 ```
