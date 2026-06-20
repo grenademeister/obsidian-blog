@@ -14,3 +14,6 @@ wheels/
 
 # Local vault copy
 vault_copy/
+
+# Runtime data (sqlite db, media cache)
+data/
