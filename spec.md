@@ -82,8 +82,9 @@ Hello
 
 **GET `/thumbnail/{thumbnail_id}`**
 
-* Returns local thumbnail image bytes for a vault-relative `thumbnail_id`
-* Returns `404` for missing files, non-images, absolute paths, or traversal
+* Returns compressed low-resolution thumbnail bytes for a vault-relative `thumbnail_id`
+* Resizes raster images to fit within 480x480 and returns WebP
+* Returns `404` for missing files, non-images, invalid images, absolute paths, or traversal
 
 **GET `/posts/{slug}`**
 

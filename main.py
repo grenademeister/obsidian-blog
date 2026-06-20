@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import logging
 import mimetypes
 import os
@@ -11,6 +12,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from functools import lru_cache
 from html import escape
+from io import BytesIO
 from pathlib import Path
 from pathlib import PurePosixPath
 from urllib.parse import quote, urlparse
@@ -18,9 +20,11 @@ from urllib.parse import quote, urlparse
 import mistune
 import uvicorn
 import yaml
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, Response
+from mistune.plugins.math import math_in_list, math_in_quote
+from PIL import Image, ImageOps, UnidentifiedImageError
 from pydantic import BaseModel
 
 
@@ -32,6 +36,11 @@ DEFAULT_CORS_ORIGINS = ["https://grenademeister.github.io"]
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".svg"}
 SAFE_LINK_SCHEMES = {"http", "https", "mailto"}
 SAFE_IMAGE_SCHEMES = {"http", "https"}
+THUMBNAIL_MAX_SIZE = (480, 480)
+THUMBNAIL_WEBP_QUALITY = 70
+MEDIA_WEBP_QUALITY = 85
+MEDIA_MAX_SIZE = (1920, 1920)
+MEDIA_CACHE_MAX_AGE = 31536000
 
 
 class PostSummary(BaseModel):
@@ -72,6 +81,7 @@ class Settings:
     vault_dir: Path
     cors_origins: list[str]
     db_path: Path
+    media_cache_dir: Path
 
 
 @dataclass(frozen=True)
@@ -142,6 +152,7 @@ def get_settings() -> Settings:
         vault_dir=Path(os.getenv("VAULT_DIR", "./vault_copy")).resolve(),
         cors_origins=parse_cors_origins(os.getenv("CORS_ORIGINS")),
         db_path=Path(os.getenv("DB_PATH", "./data/blog.sqlite3")).resolve(),
+        media_cache_dir=Path(os.getenv("MEDIA_CACHE_DIR", "./data/media_cache")).resolve(),
     )
 
 
@@ -178,6 +189,30 @@ def init_db(db_path: Path) -> None:
             ON comments (post_slug, created_at)
             """
         )
+        migrate_path_view_counts(connection)
+
+
+def migrate_path_view_counts(connection: sqlite3.Connection) -> None:
+    rows = connection.execute(
+        """
+        SELECT post_slug, view_count, updated_at
+        FROM post_views
+        WHERE instr(post_slug, '/') > 0
+        """
+    ).fetchall()
+    for post_slug, view_count, updated_at in rows:
+        filename_key = view_count_key(str(post_slug))
+        connection.execute(
+            """
+            INSERT INTO post_views (post_slug, view_count, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(post_slug) DO UPDATE SET
+                view_count = post_views.view_count + excluded.view_count,
+                updated_at = MAX(post_views.updated_at, excluded.updated_at)
+            """,
+            (filename_key, view_count, updated_at),
+        )
+        connection.execute("DELETE FROM post_views WHERE post_slug = ?", (post_slug,))
 
 
 def get_db_connection(db_path: Path) -> sqlite3.Connection:
@@ -357,6 +392,10 @@ def slug_for_path(path: Path, vault_dir: Path) -> str:
     return path.relative_to(vault_dir).with_suffix("").as_posix()
 
 
+def view_count_key(slug: str) -> str:
+    return PurePosixPath(slug).name
+
+
 def body_to_plain_paragraphs(body: str) -> list[str]:
     paragraphs: list[str] = []
     for chunk in re.split(r"\n\s*\n", body):
@@ -422,12 +461,24 @@ def combine_tags(metadata: dict, body: str) -> tuple[list[str], bool]:
 
 
 def build_markdown_renderer() -> mistune.Markdown:
-    return mistune.create_markdown(
-        renderer=BlogRenderer(),
+    renderer = BlogRenderer()
+    markdown = mistune.create_markdown(
+        renderer=renderer,
         hard_wrap=True,
         escape=True,
-        plugins=["table", "url", "strikethrough"],
+        plugins=["table", "url", "strikethrough", "math", math_in_quote, math_in_list],
     )
+    renderer.register("inline_math", render_inline_math)
+    renderer.register("block_math", render_block_math)
+    return markdown
+
+
+def render_inline_math(renderer: mistune.BaseRenderer, text: str) -> str:
+    return rf'<span class="math">\({escape(text)}\)</span>'
+
+
+def render_block_math(renderer: mistune.BaseRenderer, text: str) -> str:
+    return f'<div class="math">$$\n{escape(text)}\n$$</div>\n'
 
 
 def is_safe_url(url: str, *, allowed_schemes: set[str], allow_relative: bool) -> bool:
@@ -784,9 +835,103 @@ def resolve_media_path(vault_dir: Path, asset_path: Path) -> Path:
     return resolved
 
 
-def build_file_response(path: Path) -> FileResponse:
-    media_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
-    return FileResponse(path=path, media_type=media_type, filename=path.name)
+def _media_cache_key(relative_path: Path) -> str:
+    return hashlib.sha256(relative_path.as_posix().encode()).hexdigest()[:16]
+
+
+def build_file_response(path: Path, cache_dir: Path, if_none_match: str | None = None) -> Response:
+    ext = path.suffix.lower()
+
+    try:
+        source_mtime = int(path.stat().st_mtime)
+    except OSError:
+        source_mtime = 0
+
+    etag = f'"{source_mtime}"'
+
+    if if_none_match == etag:
+        return Response(status_code=304)
+
+    if ext in {".svg", ".gif"}:
+        media_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+        return FileResponse(path=path, media_type=media_type, filename=path.name)
+
+    cache_file = None
+    cache_key = None
+    try:
+        source_path = path.resolve()
+        cache_key = _media_cache_key(source_path)
+        cache_file = cache_dir / f"{cache_key}_{source_mtime}.webp"
+        if cache_file.is_file():
+            return Response(
+                content=cache_file.read_bytes(),
+                media_type="image/webp",
+                headers={
+                    "Cache-Control": f"public, max-age={MEDIA_CACHE_MAX_AGE}, immutable",
+                    "ETag": etag,
+                    "Content-Disposition": f'inline; filename="{path.stem}.webp"',
+                },
+            )
+    except (ValueError, OSError):
+        pass
+
+    try:
+        with Image.open(path) as image:
+            image = ImageOps.exif_transpose(image)
+
+            if image.mode not in {"RGB", "RGBA"}:
+                has_transparency = "transparency" in image.info
+                image = image.convert("RGBA" if has_transparency else "RGB")
+
+            image.thumbnail(MEDIA_MAX_SIZE, Image.Resampling.LANCZOS)
+
+            buffer = BytesIO()
+            image.save(buffer, format="WEBP", quality=MEDIA_WEBP_QUALITY, method=6)
+            content = buffer.getvalue()
+    except (OSError, UnidentifiedImageError):
+        media_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+        return FileResponse(path=path, media_type=media_type, filename=path.name)
+
+    if cache_file is not None:
+        cache_file.parent.mkdir(parents=True, exist_ok=True)
+        for old in cache_file.parent.glob(f"{cache_key}_*.webp"):
+            if old.name != cache_file.name:
+                old.unlink(missing_ok=True)
+        cache_file.write_bytes(content)
+
+    return Response(
+        content=content,
+        media_type="image/webp",
+        headers={
+            "Cache-Control": f"public, max-age={MEDIA_CACHE_MAX_AGE}, immutable",
+            "ETag": etag,
+            "Content-Disposition": f'inline; filename="{path.stem}.webp"',
+        },
+    )
+
+
+def build_thumbnail_response(path: Path) -> Response:
+    try:
+        with Image.open(path) as image:
+            image = ImageOps.exif_transpose(image)
+            image.thumbnail(THUMBNAIL_MAX_SIZE, Image.Resampling.LANCZOS)
+
+            if image.mode not in {"RGB", "RGBA"}:
+                has_transparency = "transparency" in image.info
+                image = image.convert("RGBA" if has_transparency else "RGB")
+
+            buffer = BytesIO()
+            image.save(buffer, format="WEBP", quality=THUMBNAIL_WEBP_QUALITY, method=6)
+    except (OSError, UnidentifiedImageError) as exc:
+        raise HTTPException(status_code=404, detail="Thumbnail not found") from exc
+
+    return Response(
+        content=buffer.getvalue(),
+        media_type="image/webp",
+        headers={
+            "Content-Disposition": f'inline; filename="{path.stem}.webp"',
+        },
+    )
 
 
 def build_search_text(post: LoadedPost) -> str:
@@ -840,7 +985,7 @@ def create_app(settings: Settings | None = None, initialize_db: bool = True) -> 
     @app.get("/posts", response_model=list[PostSummary])
     def list_posts() -> list[PostSummary]:
         posts = get_cached_posts(settings.vault_dir)
-        view_counts = fetch_view_counts(settings.db_path, [post.slug for post in posts])
+        view_counts = fetch_view_counts(settings.db_path, [view_count_key(post.slug) for post in posts])
         return [
             PostSummary(
                 title=post.title,
@@ -848,7 +993,7 @@ def create_app(settings: Settings | None = None, initialize_db: bool = True) -> 
                 date=post.date,
                 tags=post.tags,
                 summary=post.summary,
-                view_count=view_counts.get(post.slug, 0),
+                view_count=view_counts.get(view_count_key(post.slug), 0),
                 thumbnail_id=post.thumbnail_id,
             )
             for post in posts
@@ -864,7 +1009,7 @@ def create_app(settings: Settings | None = None, initialize_db: bool = True) -> 
             matches = search_posts(posts, q)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        view_counts = fetch_view_counts(settings.db_path, [post.slug for post in matches])
+        view_counts = fetch_view_counts(settings.db_path, [view_count_key(post.slug) for post in matches])
         return [
             PostSummary(
                 title=post.title,
@@ -872,7 +1017,7 @@ def create_app(settings: Settings | None = None, initialize_db: bool = True) -> 
                 date=post.date,
                 tags=post.tags,
                 summary=post.summary,
-                view_count=view_counts.get(post.slug, 0),
+                view_count=view_counts.get(view_count_key(post.slug), 0),
                 thumbnail_id=post.thumbnail_id,
             )
             for post in matches
@@ -880,8 +1025,8 @@ def create_app(settings: Settings | None = None, initialize_db: bool = True) -> 
 
     @app.post("/posts/{slug:path}/view", response_model=ViewCountResponse)
     def add_post_view(slug: str) -> ViewCountResponse:
-        require_post(get_cached_posts(settings.vault_dir), slug)
-        view_count = increment_view_count(settings.db_path, slug)
+        post = require_post(get_cached_posts(settings.vault_dir), slug)
+        view_count = increment_view_count(settings.db_path, view_count_key(post.slug))
         return ViewCountResponse(slug=slug, view_count=view_count)
 
     @app.post("/posts/{slug:path}/comments", response_model=Comment)
@@ -890,7 +1035,7 @@ def create_app(settings: Settings | None = None, initialize_db: bool = True) -> 
         return create_comment(settings.db_path, slug, payload)
 
     @app.get("/media/by-name/{asset_name}")
-    def get_media_by_name(asset_name: str) -> FileResponse:
+    def get_media_by_name(asset_name: str, request: Request) -> Response:
         if "/" in asset_name or "\\" in asset_name:
             raise HTTPException(status_code=404, detail="Media not found")
         if not is_image_path(Path(asset_name)):
@@ -901,28 +1046,31 @@ def create_app(settings: Settings | None = None, initialize_db: bool = True) -> 
         if not matches:
             raise HTTPException(status_code=404, detail="Media not found")
         path = resolve_media_path(settings.vault_dir, matches[0])
-        return build_file_response(path)
+        return build_file_response(path, settings.media_cache_dir, request.headers.get("if-none-match"))
 
     @app.get("/media/by-path/{asset_path:path}")
-    def get_media_by_path(asset_path: str) -> FileResponse:
+    def get_media_by_path(asset_path: str, request: Request) -> Response:
         path = resolve_media_path(settings.vault_dir, Path(asset_path))
-        return build_file_response(path)
+        return build_file_response(path, settings.media_cache_dir, request.headers.get("if-none-match"))
 
     @app.get("/thumbnail/{thumbnail_id:path}")
-    def get_thumbnail(thumbnail_id: str) -> FileResponse:
+    def get_thumbnail(thumbnail_id: str) -> Response:
         path = resolve_media_path(settings.vault_dir, Path(thumbnail_id))
-        return build_file_response(path)
+        return build_thumbnail_response(path)
 
     @app.get("/posts/{slug:path}", response_model=PostDetail)
     def get_post(slug: str) -> PostDetail:
         post = require_post(get_cached_posts(settings.vault_dir), slug)
+        stored_view_count = fetch_view_counts(settings.db_path, [view_count_key(post.slug)]).get(
+            view_count_key(post.slug), 0
+        )
         return PostDetail(
             title=post.title,
             slug=post.slug,
             date=post.date,
             tags=post.tags,
             summary=post.summary,
-            view_count=fetch_view_counts(settings.db_path, [slug]).get(slug, 0),
+            view_count=stored_view_count,
             thumbnail_id=post.thumbnail_id,
             html=post.html,
             comments=fetch_comments(settings.db_path, slug),

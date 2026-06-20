@@ -3,6 +3,7 @@ import sys
 import tempfile
 import textwrap
 from datetime import datetime
+from io import BytesIO
 from pathlib import Path
 
 import os
@@ -14,6 +15,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from fastapi.testclient import TestClient
+from PIL import Image
 
 from main import Settings, create_app, get_cached_posts, load_posts, reset_asset_cache, reset_post_cache
 
@@ -29,6 +31,7 @@ def make_app(tmp_path: Path) -> TestClient:
             vault_dir=tmp_path,
             cors_origins=["https://grenademeister.github.io"],
             db_path=make_db_path(tmp_path),
+            media_cache_dir=tmp_path / "__media_cache__",
         )
     )
     return TestClient(app)
@@ -47,6 +50,17 @@ def set_mtime(path: Path, timestamp: datetime) -> None:
 def write_binary(path: Path, content: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(content)
+
+
+def write_test_image(path: Path, size: tuple[int, int] = (1200, 800), image_format: str = "JPEG") -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    image = Image.new("RGB", size, color=(40, 90, 140))
+    image.save(path, format=image_format)
+
+
+def response_image_size(content: bytes) -> tuple[int, int]:
+    with Image.open(BytesIO(content)) as image:
+        return image.size
 
 
 @pytest.fixture(autouse=True)
@@ -616,19 +630,20 @@ def test_remote_images_do_not_become_thumbnails(tmp_path: Path) -> None:
     assert response.json()["thumbnail_id"] is None
 
 
-def test_thumbnail_endpoint_serves_image_bytes(tmp_path: Path) -> None:
-    image_bytes = b"fake-thumbnail-data"
-    write_binary(tmp_path / "00_Meta" / "cover.jpg", image_bytes)
+def test_thumbnail_endpoint_serves_compressed_low_res_image(tmp_path: Path) -> None:
+    write_test_image(tmp_path / "00_Meta" / "cover.jpg")
+    original_size = (tmp_path / "00_Meta" / "cover.jpg").stat().st_size
 
     client = make_app(tmp_path)
     response = client.get("/thumbnail/00_Meta/cover.jpg")
 
     assert response.status_code == 200
-    assert response.content == image_bytes
-    assert response.headers["content-type"].startswith("image/jpeg")
+    assert response.headers["content-type"].startswith("image/webp")
+    assert response_image_size(response.content) == (480, 320)
+    assert len(response.content) < original_size
 
 
-def test_thumbnail_endpoint_rejects_traversal_and_non_image_files(tmp_path: Path) -> None:
+def test_thumbnail_endpoint_rejects_traversal_non_image_and_invalid_image_files(tmp_path: Path) -> None:
     write_note(
         tmp_path / "plain.md",
         """
@@ -637,13 +652,16 @@ def test_thumbnail_endpoint_rejects_traversal_and_non_image_files(tmp_path: Path
         Body.
         """,
     )
+    write_binary(tmp_path / "broken.jpg", b"not-an-image")
 
     client = make_app(tmp_path)
     traversal = client.get("/thumbnail/../plain.md")
     non_image = client.get("/thumbnail/plain.md")
+    invalid_image = client.get("/thumbnail/broken.jpg")
 
     assert traversal.status_code == 404
     assert non_image.status_code == 404
+    assert invalid_image.status_code == 404
 
 
 def test_post_detail_renders_code_tables_blockquotes_and_external_links(tmp_path: Path) -> None:
@@ -686,6 +704,54 @@ def test_post_detail_renders_code_tables_blockquotes_and_external_links(tmp_path
     assert 'href="https://example.com/docs"' in html
     assert 'target="_blank"' in html
     assert 'rel="noopener noreferrer nofollow"' in html
+
+
+def test_post_detail_renders_inline_and_block_math(tmp_path: Path) -> None:
+    write_note(
+        tmp_path / "math.md",
+        r"""
+        #publish
+
+        Inline formula: $E = mc^2$.
+
+        $$
+        \frac{a}{b}
+        $$
+
+        > Quoted formula: $x^2$.
+
+        - Listed formula: $y^2$.
+        """,
+    )
+
+    client = make_app(tmp_path)
+    response = client.get("/posts/math")
+
+    assert response.status_code == 200
+    html = response.json()["html"]
+    assert r'<span class="math">\(E = mc^2\)</span>' in html
+    assert '<div class="math">$$\n\\frac{a}{b}\n$$</div>' in html
+    assert r'<span class="math">\(x^2\)</span>' in html
+    assert r'<span class="math">\(y^2\)</span>' in html
+
+
+def test_post_detail_escapes_html_inside_math(tmp_path: Path) -> None:
+    write_note(
+        tmp_path / "unsafe-math.md",
+        """
+        #publish
+
+        $<img src=x onerror=alert(1)>$
+        """,
+    )
+
+    client = make_app(tmp_path)
+    response = client.get("/posts/unsafe-math")
+
+    assert response.status_code == 200
+    html = response.json()["html"]
+    assert "<img " not in html
+    assert "&lt;img src=x onerror=alert(1)&gt;" in html
 
 
 def test_media_by_name_serves_image_bytes(tmp_path: Path) -> None:
@@ -802,7 +868,7 @@ def test_post_detail_404_for_missing_or_unpublished(tmp_path: Path) -> None:
     assert private.status_code == 404
 
 
-def test_duplicate_basenames_use_unique_vault_relative_slugs(tmp_path: Path) -> None:
+def test_duplicate_basenames_use_unique_vault_relative_slugs_and_shared_view_count(tmp_path: Path) -> None:
     write_note(
         tmp_path / "alpha" / "shared.md",
         """
@@ -853,9 +919,11 @@ def test_duplicate_basenames_use_unique_vault_relative_slugs(tmp_path: Path) -> 
     assert beta_detail.json()["summary"] == "Beta content."
     assert [post["slug"] for post in search_response.json()] == ["alpha/shared", "beta team/shared"]
     assert first_view.json() == {"slug": "alpha/shared", "view_count": 1}
-    assert second_view.json() == {"slug": "beta team/shared", "view_count": 1}
+    assert second_view.json() == {"slug": "beta team/shared", "view_count": 2}
     assert first_comment.json()["post_slug"] == "alpha/shared"
     assert second_comment.json()["post_slug"] == "beta team/shared"
+    assert client.get("/posts/alpha/shared").json()["view_count"] == 2
+    assert client.get("/posts/beta%20team/shared").json()["view_count"] == 2
     assert [comment["body"] for comment in client.get("/posts/alpha/shared").json()["comments"]] == ["Alpha comment."]
     assert [comment["body"] for comment in client.get("/posts/beta%20team/shared").json()["comments"]] == ["Beta comment."]
 
@@ -953,6 +1021,71 @@ def test_post_view_endpoint_increments_persistently(tmp_path: Path) -> None:
     assert second.json() == {"slug": "post", "view_count": 2}
     assert detail.json()["view_count"] == 2
     assert posts.json()[0]["view_count"] == 2
+
+
+def test_post_view_count_survives_moving_file_to_another_directory(tmp_path: Path) -> None:
+    original_path = tmp_path / "first" / "post.md"
+    moved_path = tmp_path / "second" / "post.md"
+    write_note(
+        original_path,
+        """
+        #publish
+
+        Body.
+        """,
+    )
+
+    client = make_app(tmp_path)
+    first = client.post("/posts/first/post/view")
+
+    moved_path.parent.mkdir(parents=True)
+    original_path.rename(moved_path)
+    reset_post_cache()
+
+    detail = client.get("/posts/second/post")
+    second = client.post("/posts/second/post/view")
+
+    assert first.json() == {"slug": "first/post", "view_count": 1}
+    assert detail.status_code == 200
+    assert detail.json()["view_count"] == 1
+    assert second.json() == {"slug": "second/post", "view_count": 2}
+
+
+def test_legacy_path_indexed_view_count_is_migrated_to_filename_key(tmp_path: Path) -> None:
+    write_note(
+        tmp_path / "nested" / "post.md",
+        """
+        #publish
+
+        Body.
+        """,
+    )
+    db_path = make_db_path(tmp_path)
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE post_views (
+                post_slug TEXT PRIMARY KEY,
+                view_count INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            "INSERT INTO post_views (post_slug, view_count, updated_at) VALUES (?, ?, ?)",
+            ("nested/post", 7, "2026-06-07T00:00:00+00:00"),
+        )
+
+    client = make_app(tmp_path)
+    detail = client.get("/posts/nested/post")
+
+    assert detail.status_code == 200
+    assert detail.json()["view_count"] == 7
+    with sqlite3.connect(db_path) as connection:
+        rows = connection.execute(
+            "SELECT post_slug, view_count FROM post_views ORDER BY post_slug"
+        ).fetchall()
+    assert rows == [("post", 7)]
 
 
 def test_post_view_endpoint_rejects_missing_or_unpublished_posts(tmp_path: Path) -> None:

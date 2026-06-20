@@ -99,6 +99,11 @@ Image references currently supported:
 - Standard Markdown local images such as `![Alt](../../00_Meta/growth.png)`
 - Standard Markdown remote images such as `![Alt](https://example.com/image.png)`
 
+LaTeX-style math is supported using `$...$` for inline formulas and `$$...$$` on
+separate lines for block formulas. The returned HTML preserves MathJax-compatible
+delimiters inside elements with the `math` class. The frontend must load and run
+MathJax or another compatible math typesetter to display the formulas.
+
 Thumbnails are local vault images. A published note may set `thumbnail` in frontmatter using either a vault-relative path such as `00_Meta/cover.jpg` or a filename such as `cover.jpg`. If `thumbnail` is missing or invalid, the backend uses the first local image reference in the note body. Remote images are never used as thumbnails.
 
 #### Publish Rule
@@ -262,6 +267,8 @@ Example response:
 
 Increments the stored view count for a published post.
 
+View counts are indexed by filename stem, so moving a note between vault directories does not reset its count. Published notes with the same filename stem share a view count.
+
 Example response:
 
 ```json
@@ -318,14 +325,15 @@ Example:
 
 #### `GET /thumbnail/{thumbnail_id}`
 
-Serves the local image identified by a post response `thumbnail_id`.
+Serves a compressed low-resolution thumbnail for the local image identified by a post response `thumbnail_id`.
 
 Behavior:
 
 - `thumbnail_id` is a vault-relative image path.
 - Only image extensions are allowed.
+- Raster images are resized to fit within 480x480 and returned as WebP.
 - Absolute paths and path traversal are rejected.
-- Returns `404` if the image does not exist.
+- Returns `404` if the image does not exist or cannot be decoded.
 
 Example:
 
